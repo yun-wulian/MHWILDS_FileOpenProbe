@@ -1,0 +1,4 @@
+enabled=1
+mode=rf_chain
+trace_enabled=1
+custom_pak_dir=E:\SteamLibrary\steamapps\common\MonsterHunterWilds\test_pak

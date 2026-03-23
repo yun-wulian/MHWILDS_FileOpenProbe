@@ -1,0 +1,10 @@
+build/
+build_nodrop/
+.vs/
+
+dotnet/**/bin/
+dotnet/**/obj/
+
+*.user
+*.suo
+*.VC.db
