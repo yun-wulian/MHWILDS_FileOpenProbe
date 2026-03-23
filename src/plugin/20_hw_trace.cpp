@@ -1,3 +1,7 @@
+#include "plugin_internal.hpp"
+
+namespace mhwilds::probe {
+
 #if defined(MHWILDS_VERSION_PROXY)
 uint64_t encode_hw_breakpoint_dr7(uint64_t dr7, int slot, bool enable, HwBreakpointType type, size_t size);
 
@@ -879,4 +883,6 @@ void uninstall_hw_instruction_trace() {
     g_hw_trace_refresh_thread_started = false;
 }
 #endif
+
+} // namespace mhwilds::probe
 

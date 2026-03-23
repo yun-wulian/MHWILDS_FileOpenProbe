@@ -1,3 +1,7 @@
+#include "plugin_internal.hpp"
+
+namespace mhwilds::probe {
+
 std::optional<HANDLE> try_open_virtual_pak(
     LPCWSTR file_name,
     DWORD desired_access,
@@ -1313,4 +1317,6 @@ bool install_directstorage_hook() {
 
     return installed;
 }
+
+} // namespace mhwilds::probe
 

@@ -1,167 +1,6 @@
-#if defined(MHWILDS_VERSION_PROXY)
-constexpr wchar_t kLogRelativePath[] = L"mhwilds_version_proxy.log";
-constexpr wchar_t kTraceLogRelativePath[] = L"mhwilds_instruction_trace.log";
-constexpr wchar_t kLoaderConfigRelativePath[] = L"mhwilds_virtual_pak_loader.ini";
-#else
-constexpr wchar_t kLogRelativePath[] = L"reframework\\plugins\\mhwilds_file_open_probe.log";
-constexpr wchar_t kTraceLogRelativePath[] = L"reframework\\plugins\\mhwilds_instruction_trace.log";
-constexpr wchar_t kLoaderConfigRelativePath[] = L"reframework\\plugins\\mhwilds_virtual_pak_loader.ini";
-#endif
-constexpr wchar_t kFocusPakPathFragment[] = L"\\pak_mods\\";
-constexpr wchar_t kEncryptedModExtension[] = L".mhwsmod";
-constexpr wchar_t kStagedRuntimePakExtension[] = L".cache";
-constexpr wchar_t kStageIndexFileName[] = L"4b1e6d2f90c84ab6b25f8d13f6a77102.bin";
-constexpr char kStageIndexPlainMagic[] = "MHWSSI1\n";
-constexpr wchar_t kUpdateCacheDirName[] = L"MHWILDSVersionProxy";
-constexpr wchar_t kUpdateCacheFileName[] = L"update_cache.dat";
-constexpr uint32_t kDefaultUpdateTimeoutMs = 4000;
-constexpr uint32_t kDefaultUpdateCacheTtlMinutes = 30;
+#include "plugin_internal.hpp"
 
-#if !defined(MHWILDS_LOADER_VERSION)
-#define MHWILDS_LOADER_VERSION "0.0.0"
-#endif
-
-constexpr char kLoaderBuildVersion[] = MHWILDS_LOADER_VERSION;
-
-constexpr uintptr_t kOpenStreamRva = 0xBBC10;
-constexpr std::array<uintptr_t, 2> kCreateFileCallsiteRvas{
-    0xBBD6D,
-    0xBBE74,
-};
-constexpr uintptr_t kDirectStorageCallsiteRva = 0x51EA36;
-constexpr uintptr_t kDefaultTraceStartRva = 0xBBDD2;
-constexpr uint32_t kDefaultTraceMaxInstructions = 200;
-constexpr uint32_t kDefaultWatchTraceMaxInstructions = 512;
-constexpr uint32_t kWatchTraceDetailedPrefixSteps = 32;
-constexpr uint32_t kWatchTracePeriodicStepInterval = 32;
-constexpr size_t kWatchTraceStackSnapshotEntries = 16;
-constexpr size_t kTraceBytePreviewCount = 8;
-constexpr uintptr_t kSecondStageTraceArmRva = 0x18DA1111;
-constexpr uintptr_t kSecondStageTraceWatchFieldOffset = 0x58;
-constexpr uintptr_t kSecondStageTraceWatchNextFieldOffset = 0x60;
-constexpr uintptr_t kSecondStageTraceOwnerFieldOffset = 0x2A0;
-constexpr size_t kSecondStageTraceWatchSize = sizeof(uint64_t);
-constexpr size_t kHwBreakpointSlotCount = 4;
-constexpr int kEntryBreakpointSlot = 0;
-constexpr int kWatchBreakpointSlotNode58 = 0;
-constexpr int kWatchBreakpointSlotNode60 = 1;
-constexpr int kWatchBreakpointSlotOwner2A0 = 2;
-
-using CreateFileWFn = HANDLE(WINAPI*)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
-using ReadFileFn = BOOL(WINAPI*)(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED);
-using SetFilePointerExFn = BOOL(WINAPI*)(HANDLE, LARGE_INTEGER, PLARGE_INTEGER, DWORD);
-using GetFileSizeExFn = BOOL(WINAPI*)(HANDLE, PLARGE_INTEGER);
-using GetFileTypeFn = DWORD(WINAPI*)(HANDLE);
-using GetFileInformationByHandleFn = BOOL(WINAPI*)(HANDLE, LPBY_HANDLE_FILE_INFORMATION);
-using GetFileInformationByHandleExFn = BOOL(WINAPI*)(HANDLE, FILE_INFO_BY_HANDLE_CLASS, LPVOID, DWORD);
-using CreateFileMappingWFn = HANDLE(WINAPI*)(HANDLE, LPSECURITY_ATTRIBUTES, DWORD, DWORD, DWORD, LPCWSTR);
-using MapViewOfFileFn = LPVOID(WINAPI*)(HANDLE, DWORD, DWORD, DWORD, SIZE_T);
-using CloseHandleFn = BOOL(WINAPI*)(HANDLE);
-using NtQueryInformationFileFn = NTSTATUS(NTAPI*)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, FILE_INFORMATION_CLASS);
-using DirectStorageOpenFn = int64_t(__fastcall*)(void* rcx, const void* rdx, void* r8, void* r9);
-
-enum class HwBreakpointType : uint8_t {
-    Execute = 0,
-    Write = 1,
-    Io = 2,
-    ReadWrite = 3,
-};
-
-enum class HwTraceCaptureKind : uint8_t {
-    Entry = 0,
-    Watch = 1,
-};
-
-struct HwBreakpointSlotConfig {
-    bool enabled{};
-    uintptr_t address{};
-    HwBreakpointType type{HwBreakpointType::Execute};
-    size_t size{1};
-};
-
-struct VirtualPakLoaderConfig {
-    bool enabled{};
-    bool observer_only{};
-    bool backend_only{};
-    bool record_only{};
-    bool rf_chain_mode{};
-    bool reframework_pak_dir_enabled{};
-    bool plain_source{};
-    bool passthrough{};
-    bool stage_source{};
-    bool keep_staged_file{};
-    bool redirect{};
-    bool trace_enabled{};
-    std::wstring target_path{};
-    std::wstring target_path_normalized{};
-    std::wstring source_path{};
-    std::wstring custom_pak_dir{};
-    std::wstring stage_root{};
-    int target_patch_num{-1};
-    int base_patch_num{-1};
-    int reframework_source_count{};
-    int custom_source_count{};
-    int encrypted_mod_source_count{};
-    int encrypted_mod_staged_count{};
-    int total_patch_num{-1};
-    uintptr_t trace_start_rva{kDefaultTraceStartRva};
-    uint32_t trace_max_instructions{kDefaultTraceMaxInstructions};
-};
-
-struct VirtualPakHandleState {
-    std::wstring requested_path{};
-    std::wstring source_path{};
-    std::shared_ptr<std::vector<uint8_t>> payload{};
-    uint64_t position{};
-    bool synthetic_handle{true};
-};
-
-struct VirtualMappingHandleState {
-    std::wstring path{};
-    std::shared_ptr<std::vector<uint8_t>> payload{};
-    bool synthetic_handle{true};
-};
-
-struct VirtualPakPayloadCache {
-    std::wstring source_path{};
-    std::filesystem::file_time_type write_time{};
-    std::shared_ptr<std::vector<uint8_t>> payload{};
-};
-
-struct VirtualPakStageCache {
-    std::wstring source_path{};
-    std::filesystem::file_time_type write_time{};
-    std::wstring staged_path{};
-    std::wstring staged_dir{};
-};
-
-struct EncryptedModStageCache {
-    std::wstring staged_dir{};
-    std::vector<std::wstring> staged_paths{};
-};
-
-struct ModMetadataRecord {
-    std::wstring source_path{};
-    std::wstring display_name{};
-    std::wstring mod_version{};
-    std::wstring update_url{};
-    std::wstring author{};
-    bool metadata_present{};
-    bool authenticated{};
-};
-
-struct UpdatePromptRequest {
-    std::wstring title{};
-    std::wstring main_instruction{};
-    std::wstring message{};
-    std::vector<std::wstring> urls{};
-};
-
-struct ModUpdateCheckResult {
-    ModMetadataRecord metadata{};
-    std::string remote_version{};
-    std::string announcement{};
-};
+namespace mhwilds::probe {
 
 REFrameworkPluginFunctions g_ref{};
 
@@ -252,6 +91,7 @@ std::optional<std::array<uint8_t, 16>> g_cached_game_fingerprint{};
 std::wstring g_cached_game_fingerprint_source{};
 std::deque<UpdatePromptRequest> g_pending_update_prompts{};
 std::atomic<uint64_t> g_virtual_handle_counter{1};
+
 #if defined(MHWILDS_VERSION_PROXY)
 HMODULE g_version_proxy_real_module{};
 PVOID g_patch_version_veh_handle{};
@@ -282,12 +122,6 @@ std::atomic<bool> g_hw_trace_watch_armed{false};
 std::atomic<bool> g_hw_trace_watch_triggered{false};
 #endif
 
-struct RedirectPathBreakpointSite {
-    uintptr_t addr{};
-    uint8_t original_byte{};
-    const char* label{};
-};
-
 std::array<RedirectPathBreakpointSite, kCreateFileCallsiteRvas.size()> g_redirect_createfile_sites{};
 RedirectPathBreakpointSite g_redirect_directstorage_site{};
 PVOID g_redirect_path_veh_handle{};
@@ -296,60 +130,13 @@ thread_local uint8_t t_redirect_pending_breakpoint_original_byte{};
 thread_local std::wstring t_redirect_source_path_storage{};
 thread_local std::array<uint8_t, 0x40> t_redirect_directstorage_arg_shadow{};
 thread_local uint32_t t_internal_backend_open_depth{};
+
 #if defined(MHWILDS_VERSION_PROXY)
 thread_local bool t_hw_trace_single_step_active{};
 thread_local uint32_t t_hw_trace_single_step_index{};
 thread_local HwTraceCaptureKind t_hw_trace_capture_kind{HwTraceCaptureKind::Entry};
 thread_local uintptr_t t_hw_trace_last_logged_rip{};
 #endif
-
-void initialize_fixed_addresses();
-bool looks_like_wide_string_at(const wchar_t* text);
-std::wstring read_wide_string_safe(const wchar_t* text);
-std::optional<std::wstring> extract_directstorage_path(const void* arg);
-std::wstring normalize_path_for_match(const std::wstring& value);
-void run_hw_trace_reapply_loop();
-void ensure_hw_trace_refresh_thread_running(const char* source);
-bool path_matches_virtual_target_locked(const std::wstring& normalized_path, const VirtualPakLoaderConfig& config);
-std::optional<std::wstring> resolve_redirect_source_for_requested_path(std::wstring_view requested_path);
-int count_effective_virtual_source_paths(const VirtualPakLoaderConfig& config);
-bool load_reframework_pak_directory_enabled_from_disk();
-std::vector<std::wstring> resolve_effective_rf_chain_pak_paths(const VirtualPakLoaderConfig& config);
-std::vector<std::wstring> resolve_encrypted_custom_mod_paths();
-std::vector<std::wstring> stage_encrypted_custom_mods_into_local_dir(const VirtualPakLoaderConfig& config);
-std::vector<std::wstring> resolve_local_custom_pak_paths(const VirtualPakLoaderConfig& config);
-std::optional<ModMetadataRecord> load_mod_metadata_record(const std::filesystem::path& source_path);
-bool install_same_point_reframework_chain_hooks();
-void uninstall_same_point_reframework_chain_hooks();
-void schedule_update_check_worker();
-
-struct CallerContext {
-    uintptr_t return_address{};
-    HMODULE module{};
-    std::wstring module_path{L"<unknown>"};
-    std::wstring module_name{};
-    bool near_createfile_site{};
-};
-
-class ScopedInternalBackendOpen {
-public:
-    ScopedInternalBackendOpen() {
-        ++t_internal_backend_open_depth;
-    }
-
-    ~ScopedInternalBackendOpen() {
-        if (t_internal_backend_open_depth != 0) {
-            --t_internal_backend_open_depth;
-        }
-    }
-
-    ScopedInternalBackendOpen(const ScopedInternalBackendOpen&) = delete;
-    ScopedInternalBackendOpen& operator=(const ScopedInternalBackendOpen&) = delete;
-};
-
-bool is_internal_backend_open_active() {
-    return t_internal_backend_open_depth != 0;
-}
 
 std::wstring widen_module_path(HMODULE module) {
     std::wstring buffer(MAX_PATH, L'\0');
@@ -475,3 +262,4 @@ void append_trace_log_line(const std::string& line) {
     g_trace_log.flush();
 }
 
+} // namespace mhwilds::probe

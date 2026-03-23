@@ -1,3 +1,9 @@
+#include "plugin_internal.hpp"
+
+namespace mhwilds::probe {
+
+LONG CALLBACK redirect_path_veh_handler(EXCEPTION_POINTERS* exception_info);
+
 bool path_matches_virtual_target(const std::wstring& path) {
     const auto normalized = normalize_path_for_match(path);
     std::scoped_lock _{g_virtual_loader_mutex};
@@ -43,7 +49,7 @@ HANDLE create_virtual_file_handle(
     const std::wstring& requested_path,
     const std::wstring& source_path,
     std::shared_ptr<std::vector<uint8_t>> payload,
-    HANDLE backing_handle = nullptr) {
+    HANDLE backing_handle) {
     auto handle = backing_handle;
     const auto synthetic_handle = handle == nullptr || handle == INVALID_HANDLE_VALUE;
     if (synthetic_handle) {
@@ -68,7 +74,7 @@ HANDLE create_virtual_file_handle(
 HANDLE create_virtual_mapping_handle(
     const std::wstring& path,
     std::shared_ptr<std::vector<uint8_t>> payload,
-    HANDLE backing_handle = nullptr) {
+    HANDLE backing_handle) {
     auto handle = backing_handle;
     const auto synthetic_handle = handle == nullptr || handle == INVALID_HANDLE_VALUE;
     if (synthetic_handle) {
@@ -985,4 +991,6 @@ NTSTATUS patch_virtual_nt_query_information_file(
         return static_cast<NTSTATUS>(0);
     }
 }
+
+} // namespace mhwilds::probe
 

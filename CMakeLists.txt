@@ -26,14 +26,14 @@ set(SAFETYHOOK_FETCH_ZYDIS ON CACHE BOOL "" FORCE)
 add_subdirectory(dependencies/safetyhook EXCLUDE_FROM_ALL)
 
 set(PROBE_PLUGIN_IMPL_FILES
-    src/plugin/00_state_and_preamble.inl
-    src/plugin/10_redirect_and_path.inl
-    src/plugin/20_hw_trace.inl
-    src/plugin/30_config_and_crypto.inl
-    src/plugin/40_matching_and_tracking.inl
-    src/plugin/50_virtual_fs_and_hooks.inl
-    src/plugin/60_bootstrap_and_shutdown.inl
-    src/plugin/70_update_check.inl
+    src/plugin/00_state_and_preamble.cpp
+    src/plugin/10_redirect_and_path.cpp
+    src/plugin/20_hw_trace.cpp
+    src/plugin/30_config_and_crypto.cpp
+    src/plugin/40_matching_and_tracking.cpp
+    src/plugin/50_virtual_fs_and_hooks.cpp
+    src/plugin/60_bootstrap_and_shutdown.cpp
+    src/plugin/70_update_check.cpp
 )
 
 add_library(MHWILDSFileOpenProbe SHARED

@@ -41,17 +41,20 @@ What is not solved yet:
 - We still need to verify whether same-point `SafetyHook` hooks can coexist cleanly with REFramework in this specific pak-loading path.
 - The current test build only targets explicit external pak paths first; temp staging and encryption will come later.
 
-## Project Layout
+## Project Layout## Project Layout
 
-The old single huge `src/plugin.cpp` has been flattened into a thin entry file plus implementation fragments under `src/plugin/`.
+The loader code is now a normal multi-translation-unit C++ layout. `src/plugin.cpp` stays thin and the actual implementation lives in `src/plugin/*.cpp`, with shared declarations centralized in one internal header.
 
 ### Top-Level Files
 
 - `src/plugin.cpp`
-  - Thin entry file.
-  - Keeps exports, `DllMain`, and includes the implementation fragments in order.
+  - Thin entry / export file.
+  - Holds the `version.dll` proxy exports, REFramework plugin exports, and `DllMain`.
+- `src/plugin/plugin_internal.hpp`
+  - Shared internal declarations for the loader.
+  - Centralizes common includes, constants, structs, globals, and cross-module function declarations.
 - `src/packer.cpp`
-  - AES-based packer for producing the encrypted payload container used by the proxy.
+  - Native packer for producing the encrypted `.mhwsmod` container.
 - `tools/make_mhwsmod.py`
   - Thin Python wrapper around the native packer executable.
 - `src/version_proxy.def`
@@ -61,26 +64,28 @@ The old single huge `src/plugin.cpp` has been flattened into a thin entry file p
 - `include/reframework_plugin_minimal.hpp`
   - Minimal REFramework plugin ABI definitions.
 
-### Implementation Fragments
+### Loader Modules
 
-- `src/plugin/00_state_and_preamble.inl`
-  - Constants, structs, globals, shared state, basic path/log helpers.
-- `src/plugin/10_redirect_and_path.inl`
-  - Redirect breakpoints, patch-version breakpoint, path parsing, low-level helpers.
-- `src/plugin/20_hw_trace.inl`
-  - VEH + hardware-breakpoint trace pipeline, stack snapshot, multi-stage trace logic.
-- `src/plugin/30_config_and_crypto.inl`
-  - INI loading, AES decrypt path, key derivation, payload loading.
-- `src/plugin/40_matching_and_tracking.inl`
-  - Target matching, caller tracking, handle tracking, bookkeeping.
-- `src/plugin/50_virtual_fs_and_hooks.inl`
-  - Virtual file implementation and Win32 hook bodies.
-- `src/plugin/60_bootstrap_and_shutdown.inl`
-  - Hook install/bootstrap, retry logic, shutdown cleanup.
+- `src/plugin/00_state_and_preamble.cpp`
+  - Shared state, constants, globals, and basic path/log helpers.
+- `src/plugin/10_redirect_and_path.cpp`
+  - Patch-slot redirect logic, patch-version handling, path parsing, and low-level helpers.
+- `src/plugin/20_hw_trace.cpp`
+  - VEH and hardware-breakpoint instruction tracing.
+- `src/plugin/30_config_and_crypto.cpp`
+  - Config loading, key derivation, AES decrypt flow, and payload loading.
+- `src/plugin/40_matching_and_tracking.cpp`
+  - Target matching, caller/handle tracking, and bookkeeping.
+- `src/plugin/50_virtual_fs_and_hooks.cpp`
+  - Virtual file semantics and Win32 hook bodies.
+- `src/plugin/60_bootstrap_and_shutdown.cpp`
+  - Hook installation, bootstrap sequencing, retry logic, and cleanup.
+- `src/plugin/70_update_check.cpp`
+  - Loader / mod update check flow and prompt helpers.
 
-This is still intentionally one translation unit for now. The split is structural, not behavioral. That keeps the refactor low-risk while making the codebase easier to navigate.
+The refactor is structural and behavioral: the old `inl` aggregation has been removed, and the project now builds as real `h + cpp` translation units.
 
-## Build
+## Build## Build
 
 ```powershell
 cmake -S G:\MHWILDS_FileOpenProbe -B G:\MHWILDS_FileOpenProbe\build -G "Visual Studio 17 2022" -A x64

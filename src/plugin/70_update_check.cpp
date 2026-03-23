@@ -1,3 +1,7 @@
+#include "plugin_internal.hpp"
+
+namespace mhwilds::probe {
+
 #if defined(MHWILDS_VERSION_PROXY)
 constexpr wchar_t kLoaderUpdatePostUrl[] = L"https://www.caimogu.cc/post/2339976.html";
 constexpr int kUpdatePromptOpenButtonId = 1001;
@@ -876,3 +880,5 @@ void schedule_update_check_worker() {
     }
 }
 #endif
+
+} // namespace mhwilds::probe

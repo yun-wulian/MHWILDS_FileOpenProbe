@@ -1,3 +1,7 @@
+#include "plugin_internal.hpp"
+
+namespace mhwilds::probe {
+
 void ensure_stage_startup_cleanup(const VirtualPakLoaderConfig& config);
 void persist_stage_session_index(const VirtualPakLoaderConfig& config, const std::filesystem::path& session_dir);
 std::optional<std::vector<uint8_t>> decode_v2_encrypted_pak_bytes(const std::vector<uint8_t>& file_bytes, uint32_t expected_purpose);
@@ -2008,4 +2012,6 @@ bool path_matches_record_target_locked(const std::wstring& normalized_path, cons
 
     return normalized_path_matches_target(normalized_path, config.target_path_normalized);
 }
+
+} // namespace mhwilds::probe
 

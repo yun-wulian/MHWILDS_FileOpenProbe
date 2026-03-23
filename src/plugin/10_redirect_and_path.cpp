@@ -1,3 +1,7 @@
+#include "plugin_internal.hpp"
+
+namespace mhwilds::probe {
+
 bool read_memory_block_safe(const void* src, void* dst, size_t size) {
     __try {
         std::memcpy(dst, src, size);
@@ -972,5 +976,7 @@ std::optional<uint64_t> parse_u64_value(const std::string& value) {
 
     return parsed;
 }
+
+} // namespace mhwilds::probe
 
 

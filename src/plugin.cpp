@@ -1,54 +1,6 @@
-#include <windows.h>
-#include <tlhelp32.h>
-#include <bcrypt.h>
-#include <commctrl.h>
-#include <intrin.h>
-#include <shellapi.h>
-#include <winhttp.h>
-#include <winternl.h>
+#include "plugin/plugin_internal.hpp"
 
-#include <MinHook.h>
-#include <safetyhook.hpp>
-
-#include <algorithm>
-#include <array>
-#include <atomic>
-#include <chrono>
-#include <cctype>
-#include <cstdlib>
-#include <cstring>
-#include <cstdint>
-#include <cwctype>
-#include <deque>
-#include <filesystem>
-#include <fstream>
-#include <limits>
-#include <memory>
-#include <mutex>
-#include <optional>
-#include <regex>
-#include <set>
-#include <sstream>
-#include <string>
-#include <thread>
-#include <unordered_map>
-#include <vector>
-
-#include <json.hpp>
-
-#include "encrypted_pak_format.hpp"
-#include "reframework_plugin_minimal.hpp"
-
-namespace {
-#include "plugin/00_state_and_preamble.inl"
-#include "plugin/10_redirect_and_path.inl"
-#include "plugin/20_hw_trace.inl"
-#include "plugin/30_config_and_crypto.inl"
-#include "plugin/40_matching_and_tracking.inl"
-#include "plugin/50_virtual_fs_and_hooks.inl"
-#include "plugin/60_bootstrap_and_shutdown.inl"
-#include "plugin/70_update_check.inl"
-} // namespace
+using namespace mhwilds::probe;
 
 #if defined(MHWILDS_VERSION_PROXY)
 namespace {

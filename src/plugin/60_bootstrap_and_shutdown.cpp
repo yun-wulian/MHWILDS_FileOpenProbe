@@ -1,3 +1,7 @@
+#include "plugin_internal.hpp"
+
+namespace mhwilds::probe {
+
 void log_install_result(const char* source, bool create_file_ok, bool directstorage_ok, bool pak_io_ok, bool trace_ok) {
     VirtualPakLoaderConfig config{};
     {
@@ -308,3 +312,5 @@ void shutdown_hooks() {
         g_cached_game_fingerprint_source.clear();
     }
 }
+
+} // namespace mhwilds::probe
