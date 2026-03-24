@@ -195,8 +195,18 @@ HANDLE WINAPI hooked_create_file_w(
 
         const auto seq = g_sequence.fetch_add(1) + 1;
         const auto pak_hits = g_create_file_pak_hits.fetch_add(1) + 1;
+        if (pak_hits == 1) {
+            std::ostringstream timing_oss;
+            timing_oss << "virtual=" << static_cast<int>(is_virtual_pak)
+                << " target_match=" << static_cast<int>(is_virtual_target || is_record_target);
+            if (file_name != nullptr) {
+                timing_oss << " path=" << narrow_utf8(file_name);
+            }
+            append_timing_log_line("pak-first-createfile-hit", timing_oss.str());
+        }
         std::ostringstream oss;
         oss << "[createfile " << seq << "]"
+            << " t_ms=" << std::dec << process_uptime_ms()
             << " pak_hits=" << std::dec << pak_hits
             << describe_caller(caller)
             << std::hex
@@ -1003,9 +1013,16 @@ int64_t __fastcall hooked_directstorage_open(void* rcx, const void* rdx, void* r
     if (is_focus_pak) {
         const auto seq = g_sequence.fetch_add(1) + 1;
         const auto directstorage_hits = g_directstorage_hits.fetch_add(1) + 1;
+        if (directstorage_hits == 1) {
+            std::ostringstream timing_oss;
+            timing_oss << "virtual_target=" << static_cast<int>(is_virtual_target)
+                << " path=" << narrow_utf8(*extracted_path);
+            append_timing_log_line("pak-first-directstorage-hit", timing_oss.str());
+        }
 
         std::ostringstream before;
         before << "[directstorage " << seq << "]"
+               << " t_ms=" << std::dec << process_uptime_ms()
                << " directstorage_hits=" << std::dec << directstorage_hits
                << describe_caller(caller)
                << std::hex

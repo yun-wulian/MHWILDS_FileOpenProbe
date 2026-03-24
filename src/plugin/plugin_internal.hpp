@@ -321,6 +321,7 @@ extern std::optional<std::array<uint8_t, 16>> g_cached_game_fingerprint;
 extern std::wstring g_cached_game_fingerprint_source;
 extern std::deque<UpdatePromptRequest> g_pending_update_prompts;
 extern std::atomic<uint64_t> g_virtual_handle_counter;
+extern uint64_t g_process_start_tick_ms;
 
 #if defined(MHWILDS_VERSION_PROXY)
 extern HMODULE g_version_proxy_real_module;
@@ -375,10 +376,12 @@ std::optional<std::wstring> widen_utf8(const std::string& value);
 std::filesystem::path log_path();
 std::filesystem::path trace_log_path();
 std::filesystem::path loader_config_path();
+uint64_t process_uptime_ms();
 void open_log_if_needed();
 void open_trace_log_if_needed();
 void append_log_line(const std::string& line);
 void append_trace_log_line(const std::string& line);
+void append_timing_log_line(const char* event_name, std::string_view details = {});
 
 bool read_memory_block_safe(const void* src, void* dst, size_t size);
 bool read_u64_safe(const void* src, uint64_t* value);

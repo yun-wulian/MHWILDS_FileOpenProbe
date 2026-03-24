@@ -29,6 +29,11 @@ struct RemoteUpdateInfo {
     std::wstring source_url{};
 };
 
+struct CaimoguPostSource {
+    std::string post_id{};
+    std::wstring open_url{};
+};
+
 struct ScopedWinHttpHandle {
     HINTERNET handle{};
 
@@ -45,6 +50,305 @@ std::string to_lower_ascii_copy(std::string value) {
     }
 
     return value;
+}
+
+std::optional<CaimoguPostSource> parse_caimogu_post_source(std::wstring_view url) {
+    static const std::wregex post_regex{
+        LR"(^\s*(?:https?://)?(?:www\.)?caimogu\.cc/post/(\d+)\.html(?:[/?#].*)?\s*$)",
+        std::regex_constants::icase};
+
+    std::wsmatch match{};
+    const std::wstring owned_url{url};
+    if (!std::regex_match(owned_url, match, post_regex) || match.size() < 2) {
+        return std::nullopt;
+    }
+
+    const auto post_id_wide = trim_ascii_copy(match[1].str());
+    if (post_id_wide.empty()) {
+        return std::nullopt;
+    }
+
+    CaimoguPostSource source{};
+    source.post_id = narrow_utf8(post_id_wide);
+    source.open_url = trim_ascii_copy(owned_url);
+    return source;
+}
+
+struct ScopedBcryptAlgorithmHandleUpdate {
+    BCRYPT_ALG_HANDLE handle{};
+
+    ~ScopedBcryptAlgorithmHandleUpdate() {
+        if (handle != nullptr) {
+            BCryptCloseAlgorithmProvider(handle, 0);
+        }
+    }
+};
+
+struct ScopedBcryptHashHandleUpdate {
+    BCRYPT_HASH_HANDLE handle{};
+
+    ~ScopedBcryptHashHandleUpdate() {
+        if (handle != nullptr) {
+            BCryptDestroyHash(handle);
+        }
+    }
+};
+
+struct ScopedBcryptKeyHandleUpdate {
+    BCRYPT_KEY_HANDLE handle{};
+
+    ~ScopedBcryptKeyHandleUpdate() {
+        if (handle != nullptr) {
+            BCryptDestroyKey(handle);
+        }
+    }
+};
+
+std::optional<std::array<uint8_t, 16>> compute_md5_bytes_update(const uint8_t* bytes, size_t size) {
+    ScopedBcryptAlgorithmHandleUpdate algorithm{};
+    ScopedBcryptHashHandleUpdate hash{};
+    DWORD object_size{};
+    DWORD bytes_written{};
+    DWORD hash_size{};
+    std::vector<uint8_t> hash_object{};
+    std::array<uint8_t, 16> digest{};
+
+    if (BCryptOpenAlgorithmProvider(&algorithm.handle, BCRYPT_MD5_ALGORITHM, nullptr, 0) != 0) {
+        return std::nullopt;
+    }
+
+    if (BCryptGetProperty(
+            algorithm.handle,
+            BCRYPT_OBJECT_LENGTH,
+            reinterpret_cast<PUCHAR>(&object_size),
+            sizeof(object_size),
+            &bytes_written,
+            0) != 0 ||
+        BCryptGetProperty(
+            algorithm.handle,
+            BCRYPT_HASH_LENGTH,
+            reinterpret_cast<PUCHAR>(&hash_size),
+            sizeof(hash_size),
+            &bytes_written,
+            0) != 0 ||
+        hash_size != digest.size()) {
+        return std::nullopt;
+    }
+
+    hash_object.resize(object_size);
+    if (BCryptCreateHash(
+            algorithm.handle,
+            &hash.handle,
+            hash_object.data(),
+            static_cast<ULONG>(hash_object.size()),
+            nullptr,
+            0,
+            0) != 0) {
+        return std::nullopt;
+    }
+
+    if (bytes != nullptr && size > 0 &&
+        BCryptHashData(hash.handle, const_cast<PUCHAR>(bytes), static_cast<ULONG>(size), 0) != 0) {
+        return std::nullopt;
+    }
+
+    if (BCryptFinishHash(hash.handle, digest.data(), static_cast<ULONG>(digest.size()), 0) != 0) {
+        return std::nullopt;
+    }
+
+    return digest;
+}
+
+std::optional<std::string> compute_md5_hex_lower_update(std::string_view text) {
+    const auto digest = compute_md5_bytes_update(
+        reinterpret_cast<const uint8_t*>(text.data()),
+        text.size());
+    if (!digest.has_value()) {
+        return std::nullopt;
+    }
+
+    static constexpr char kHexDigits[] = "0123456789abcdef";
+    std::string hex(digest->size() * 2, '\0');
+    for (size_t index = 0; index < digest->size(); ++index) {
+        const auto byte = (*digest)[index];
+        hex[index * 2] = kHexDigits[(byte >> 4) & 0x0F];
+        hex[index * 2 + 1] = kHexDigits[byte & 0x0F];
+    }
+
+    return hex;
+}
+
+std::optional<std::vector<uint8_t>> encrypt_aes128_cbc_pkcs7_update(
+    std::string_view plain_text,
+    const std::array<uint8_t, 16>& key,
+    const std::array<uint8_t, 16>& iv) {
+    ScopedBcryptAlgorithmHandleUpdate algorithm{};
+    ScopedBcryptKeyHandleUpdate key_handle{};
+    DWORD object_size{};
+    DWORD bytes_written{};
+    std::vector<uint8_t> key_object{};
+    const std::vector<uint8_t> plain_bytes(plain_text.begin(), plain_text.end());
+    std::vector<uint8_t> cipher_bytes(plain_bytes.size() + 16, 0);
+    auto iv_copy = iv;
+    ULONG cipher_size{};
+
+    if (BCryptOpenAlgorithmProvider(&algorithm.handle, BCRYPT_AES_ALGORITHM, nullptr, 0) != 0) {
+        return std::nullopt;
+    }
+
+    const auto chaining_mode_bytes = static_cast<ULONG>((wcslen(BCRYPT_CHAIN_MODE_CBC) + 1) * sizeof(wchar_t));
+    if (BCryptSetProperty(
+            algorithm.handle,
+            BCRYPT_CHAINING_MODE,
+            reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(BCRYPT_CHAIN_MODE_CBC)),
+            chaining_mode_bytes,
+            0) != 0 ||
+        BCryptGetProperty(
+            algorithm.handle,
+            BCRYPT_OBJECT_LENGTH,
+            reinterpret_cast<PUCHAR>(&object_size),
+            sizeof(object_size),
+            &bytes_written,
+            0) != 0) {
+        return std::nullopt;
+    }
+
+    key_object.resize(object_size);
+    if (BCryptGenerateSymmetricKey(
+            algorithm.handle,
+            &key_handle.handle,
+            key_object.data(),
+            static_cast<ULONG>(key_object.size()),
+            const_cast<PUCHAR>(key.data()),
+            static_cast<ULONG>(key.size()),
+            0) != 0) {
+        return std::nullopt;
+    }
+
+    const auto encrypt_status = BCryptEncrypt(
+        key_handle.handle,
+        const_cast<PUCHAR>(plain_bytes.data()),
+        static_cast<ULONG>(plain_bytes.size()),
+        nullptr,
+        iv_copy.data(),
+        static_cast<ULONG>(iv_copy.size()),
+        cipher_bytes.data(),
+        static_cast<ULONG>(cipher_bytes.size()),
+        &cipher_size,
+        BCRYPT_BLOCK_PADDING);
+    if (encrypt_status != 0) {
+        return std::nullopt;
+    }
+
+    cipher_bytes.resize(cipher_size);
+    return cipher_bytes;
+}
+
+std::string base64_encode_bytes_update(const uint8_t* bytes, size_t size) {
+    static constexpr char kAlphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "abcdefghijklmnopqrstuvwxyz"
+        "0123456789+/";
+
+    std::string encoded{};
+    encoded.reserve(((size + 2) / 3) * 4);
+    for (size_t index = 0; index < size; index += 3) {
+        const auto chunk0 = bytes[index];
+        const auto chunk1 = index + 1 < size ? bytes[index + 1] : 0;
+        const auto chunk2 = index + 2 < size ? bytes[index + 2] : 0;
+        const auto combined =
+            (static_cast<uint32_t>(chunk0) << 16) |
+            (static_cast<uint32_t>(chunk1) << 8) |
+            static_cast<uint32_t>(chunk2);
+
+        encoded.push_back(kAlphabet[(combined >> 18) & 0x3F]);
+        encoded.push_back(kAlphabet[(combined >> 12) & 0x3F]);
+        encoded.push_back(index + 1 < size ? kAlphabet[(combined >> 6) & 0x3F] : '=');
+        encoded.push_back(index + 2 < size ? kAlphabet[combined & 0x3F] : '=');
+    }
+
+    return encoded;
+}
+
+std::string percent_encode_query_value_update(std::string_view value) {
+    static constexpr char kHexDigits[] = "0123456789ABCDEF";
+
+    std::string encoded{};
+    encoded.reserve(value.size() * 3);
+    for (const auto ch : value) {
+        const auto byte = static_cast<unsigned char>(ch);
+        if ((byte >= 'A' && byte <= 'Z') ||
+            (byte >= 'a' && byte <= 'z') ||
+            (byte >= '0' && byte <= '9') ||
+            byte == '-' || byte == '_' || byte == '.' || byte == '~') {
+            encoded.push_back(static_cast<char>(byte));
+            continue;
+        }
+
+        encoded.push_back('%');
+        encoded.push_back(kHexDigits[(byte >> 4) & 0x0F]);
+        encoded.push_back(kHexDigits[byte & 0x0F]);
+    }
+
+    return encoded;
+}
+
+std::optional<std::string> encrypt_caimogu_param_update(std::string_view value, std::string_view time_text) {
+    std::string key_text{time_text};
+    if (key_text.size() < 6) {
+        return std::nullopt;
+    }
+    key_text += key_text.substr(0, 6);
+    if (key_text.size() != 16) {
+        return std::nullopt;
+    }
+
+    const auto iv_hex = compute_md5_hex_lower_update(time_text);
+    if (!iv_hex.has_value() || iv_hex->size() < 16) {
+        return std::nullopt;
+    }
+
+    std::array<uint8_t, 16> key{};
+    std::array<uint8_t, 16> iv{};
+    std::memcpy(key.data(), key_text.data(), key.size());
+    std::memcpy(iv.data(), iv_hex->data(), iv.size());
+
+    const auto cipher_bytes = encrypt_aes128_cbc_pkcs7_update(value, key, iv);
+    if (!cipher_bytes.has_value()) {
+        return std::nullopt;
+    }
+
+    return base64_encode_bytes_update(cipher_bytes->data(), cipher_bytes->size());
+}
+
+std::optional<std::wstring> build_caimogu_post_detail_request_url(std::string_view post_id) {
+    if (post_id.empty()) {
+        return std::nullopt;
+    }
+
+    const auto time_text = std::to_string(static_cast<long long>(std::time(nullptr)));
+    const std::string sign_input =
+        "device=mod&id=" + std::string{post_id} +
+        "&time=" + time_text +
+        "&ver=3.0.0";
+    const auto sign = compute_md5_hex_lower_update(to_lower_ascii_copy(sign_input));
+    const auto encrypted_device = encrypt_caimogu_param_update("mod", time_text);
+    const auto encrypted_id = encrypt_caimogu_param_update(post_id, time_text);
+    const auto encrypted_ver = encrypt_caimogu_param_update("3.0.0", time_text);
+    if (!sign.has_value() ||
+        !encrypted_device.has_value() ||
+        !encrypted_id.has_value() ||
+        !encrypted_ver.has_value()) {
+        return std::nullopt;
+    }
+
+    const std::string url_utf8 =
+        "https://api.caimogu.cc/v3/post/detail?device=" + percent_encode_query_value_update(*encrypted_device) +
+        "&id=" + percent_encode_query_value_update(*encrypted_id) +
+        "&ver=" + percent_encode_query_value_update(*encrypted_ver) +
+        "&time=" + percent_encode_query_value_update(time_text) +
+        "&sign=" + percent_encode_query_value_update(*sign);
+    return widen_utf8(url_utf8);
 }
 
 std::string replace_all_copy(std::string value, std::string_view from, std::string_view to) {
@@ -291,19 +595,6 @@ std::string strip_html_tags_and_normalize(const std::string& text) {
     return trim_ascii_copy(normalized);
 }
 
-std::string extract_attachment_name_version(const std::string& body) {
-    static const std::regex attachment_name_regex{
-        R"(attachment-container[\s\S]*?class\s*=\s*["']name["'][^>]*>([\s\S]*?)</div>)",
-        std::regex_constants::icase};
-
-    std::smatch match{};
-    if (!std::regex_search(body, match, attachment_name_regex) || match.size() < 2) {
-        return {};
-    }
-
-    return strip_html_tags_and_normalize(match[1].str());
-}
-
 std::vector<std::pair<std::string, std::string>> extract_remote_announcements(const std::string& body) {
     static const std::regex announcement_regex{
         R"((\d+(?:\.\d+){1,3})\s*(?:\:|\xEF\xBC\x9A)\s*---\s*\*?\s*([\s\S]*?)\s*\*?\s*---)",
@@ -338,16 +629,54 @@ std::vector<std::pair<std::string, std::string>> extract_remote_announcements(co
     return announcements;
 }
 
-std::optional<RemoteUpdateInfo> parse_remote_update_info(const std::string& body, std::wstring_view source_url) {
+std::optional<RemoteUpdateInfo> parse_remote_update_info_from_caimogu_payload(
+    const nlohmann::json& payload,
+    std::wstring_view open_url) {
     RemoteUpdateInfo info{};
-    info.source_url = std::wstring{source_url};
+    info.source_url = std::wstring{open_url};
 
-    const auto attachment_name = extract_attachment_name_version(body);
-    if (const auto version = extract_first_version_token(attachment_name); version.has_value()) {
-        info.remote_version = *version;
+    const auto data_it = payload.find("data");
+    if (data_it == payload.end() || !data_it->is_object()) {
+        return std::nullopt;
     }
 
-    const auto announcements = extract_remote_announcements(body);
+    const auto& data = *data_it;
+    if (const auto code_it = payload.find("code");
+        code_it == payload.end() || !code_it->is_number_integer() || code_it->get<int>() != 0) {
+        return std::nullopt;
+    }
+
+    std::string content_html{};
+    if (const auto info_it = data.find("info"); info_it != data.end() && info_it->is_object()) {
+        if (const auto content_it = info_it->find("content"); content_it != info_it->end() && content_it->is_string()) {
+            content_html = content_it->get_ref<const std::string&>();
+        }
+    }
+
+    if (const auto attachment_it = data.find("attachment"); attachment_it != data.end() && attachment_it->is_array()) {
+        for (const auto& item : *attachment_it) {
+            if (!item.is_object()) {
+                continue;
+            }
+
+            const auto name_it = item.find("name");
+            if (name_it == item.end() || !name_it->is_string()) {
+                continue;
+            }
+
+            const auto attachment_name = trim_ascii_copy(name_it->get_ref<const std::string&>());
+            if (attachment_name.empty()) {
+                continue;
+            }
+
+            if (const auto version = extract_first_version_token(attachment_name); version.has_value()) {
+                info.remote_version = *version;
+                break;
+            }
+        }
+    }
+
+    const auto announcements = extract_remote_announcements(content_html);
     if (info.remote_version.empty() && !announcements.empty()) {
         info.remote_version = announcements.front().first;
     }
@@ -370,6 +699,30 @@ std::optional<RemoteUpdateInfo> parse_remote_update_info(const std::string& body
     }
 
     return info;
+}
+
+std::optional<RemoteUpdateInfo> fetch_remote_update_info_from_caimogu_post_url(std::wstring_view post_url) {
+    const auto post_source = parse_caimogu_post_source(post_url);
+    if (!post_source.has_value()) {
+        return std::nullopt;
+    }
+
+    const auto request_url = build_caimogu_post_detail_request_url(post_source->post_id);
+    if (!request_url.has_value()) {
+        return std::nullopt;
+    }
+
+    const auto body = http_get_utf8_body(*request_url);
+    if (!body.has_value()) {
+        return std::nullopt;
+    }
+
+    try {
+        const auto payload = nlohmann::json::parse(*body);
+        return parse_remote_update_info_from_caimogu_payload(payload, post_source->open_url);
+    } catch (...) {
+        return std::nullopt;
+    }
 }
 
 std::filesystem::path loader_update_cache_path() {
@@ -668,19 +1021,10 @@ UpdatePromptRequest build_mod_update_prompt_request(const std::vector<ModUpdateC
 }
 
 std::optional<ModUpdateCheckResult> check_single_mod_update(const ModMetadataRecord& metadata) {
-    const auto body = http_get_utf8_body(metadata.update_url);
-    if (!body.has_value()) {
-        std::ostringstream oss;
-        oss << "mod-update-fetch-failed source=" << narrow_utf8(metadata.source_path)
-            << " url=" << narrow_utf8(metadata.update_url) << "\n";
-        append_log_line(oss.str());
-        return std::nullopt;
-    }
-
-    const auto remote_info = parse_remote_update_info(*body, metadata.update_url);
+    const auto remote_info = fetch_remote_update_info_from_caimogu_post_url(metadata.update_url);
     if (!remote_info.has_value()) {
         std::ostringstream oss;
-        oss << "mod-update-parse-failed source=" << narrow_utf8(metadata.source_path)
+        oss << "mod-update-api-failed source=" << narrow_utf8(metadata.source_path)
             << " url=" << narrow_utf8(metadata.update_url) << "\n";
         append_log_line(oss.str());
         return std::nullopt;
@@ -711,6 +1055,7 @@ std::optional<ModUpdateCheckResult> check_single_mod_update(const ModMetadataRec
 }
 
 void run_loader_update_check_worker_body() {
+    append_timing_log_line("loader-update-worker-start");
     const auto local_version = parse_simple_version(kLoaderBuildVersion);
     std::set<std::string> prompted_versions{};
     std::optional<RemoteUpdateInfo> cached_info{};
@@ -741,18 +1086,10 @@ void run_loader_update_check_worker_body() {
     };
 
     while (!g_shutdown_requested.load()) {
-        const auto body = http_get_utf8_body(kLoaderUpdatePostUrl);
-        if (!body.has_value()) {
-            try_prompt_cached_info("fetch_failed");
-            append_log_line("loader-update-fetch-failed\n");
-            std::this_thread::sleep_for(std::chrono::milliseconds(kLoaderUpdateRetryDelayMs));
-            continue;
-        }
-
-        const auto remote_info = parse_remote_update_info(*body, kLoaderUpdatePostUrl);
+        const auto remote_info = fetch_remote_update_info_from_caimogu_post_url(kLoaderUpdatePostUrl);
         if (!remote_info.has_value()) {
-            try_prompt_cached_info("parse_failed");
-            append_log_line("loader-update-parse-failed\n");
+            try_prompt_cached_info("api_failed");
+            append_log_line("loader-update-api-failed\n");
             std::this_thread::sleep_for(std::chrono::milliseconds(kLoaderUpdateRetryDelayMs));
             continue;
         }
@@ -776,6 +1113,11 @@ void run_loader_update_check_worker_body() {
             prompted_versions.insert(remote_info->remote_version);
         }
 
+        {
+            std::ostringstream timing_oss;
+            timing_oss << "remote=" << remote_info->remote_version;
+            append_timing_log_line("loader-update-worker-finished", timing_oss.str());
+        }
         return;
     }
 }
@@ -784,6 +1126,12 @@ void run_mod_update_check_worker_body() {
     const auto mod_paths = resolve_encrypted_custom_mod_paths();
     std::vector<ModUpdateCheckResult> outdated_results{};
     outdated_results.reserve(mod_paths.size());
+
+    {
+        std::ostringstream timing_oss;
+        timing_oss << "count=" << mod_paths.size();
+        append_timing_log_line("mod-update-worker-start", timing_oss.str());
+    }
 
     std::ostringstream begin_oss;
     begin_oss << "mod-update-begin count=" << mod_paths.size() << "\n";
@@ -834,6 +1182,7 @@ void run_mod_update_check_worker_body() {
 
     if (outdated_results.empty()) {
         append_log_line("mod-update-none\n");
+        append_timing_log_line("mod-update-worker-finished", "outdated_count=0");
         return;
     }
 
@@ -842,6 +1191,12 @@ void run_mod_update_check_worker_body() {
     std::ostringstream oss;
     oss << "mod-update-summary count=" << outdated_results.size() << "\n";
     append_log_line(oss.str());
+
+    {
+        std::ostringstream timing_oss;
+        timing_oss << "outdated_count=" << outdated_results.size();
+        append_timing_log_line("mod-update-worker-finished", timing_oss.str());
+    }
 }
 
 DWORD WINAPI loader_update_check_thread_proc(LPVOID) {
@@ -858,6 +1213,8 @@ void schedule_update_check_worker() {
     if (g_update_check_thread_started.exchange(true)) {
         return;
     }
+
+    append_timing_log_line("update-check-schedule");
 
     bool loader_thread_ok = false;
     bool mod_thread_ok = false;

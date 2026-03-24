@@ -91,6 +91,7 @@ std::optional<std::array<uint8_t, 16>> g_cached_game_fingerprint{};
 std::wstring g_cached_game_fingerprint_source{};
 std::deque<UpdatePromptRequest> g_pending_update_prompts{};
 std::atomic<uint64_t> g_virtual_handle_counter{1};
+uint64_t g_process_start_tick_ms{static_cast<uint64_t>(GetTickCount64())};
 
 #if defined(MHWILDS_VERSION_PROXY)
 HMODULE g_version_proxy_real_module{};
@@ -202,6 +203,10 @@ std::filesystem::path loader_config_path() {
     return std::filesystem::current_path() / kLoaderConfigRelativePath;
 }
 
+uint64_t process_uptime_ms() {
+    return static_cast<uint64_t>(GetTickCount64()) - g_process_start_tick_ms;
+}
+
 void open_log_if_needed() {
     std::scoped_lock _{g_log_mutex};
 
@@ -260,6 +265,17 @@ void append_trace_log_line(const std::string& line) {
 
     g_trace_log << line;
     g_trace_log.flush();
+}
+
+void append_timing_log_line(const char* event_name, std::string_view details) {
+    std::ostringstream oss;
+    oss << "[timing] t_ms=" << process_uptime_ms()
+        << " event=" << (event_name != nullptr ? event_name : "<null>");
+    if (!details.empty()) {
+        oss << ' ' << details;
+    }
+    oss << '\n';
+    append_log_line(oss.str());
 }
 
 } // namespace mhwilds::probe
