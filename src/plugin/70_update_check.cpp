@@ -6,8 +6,7 @@ namespace mhwilds::probe {
 constexpr wchar_t kLoaderUpdatePostUrl[] = L"https://www.caimogu.cc/post/2339976.html";
 constexpr int kUpdatePromptOpenButtonId = 1001;
 constexpr int kUpdatePromptIgnoreButtonId = 1002;
-constexpr uint32_t kLoaderUpdateRetryDelayMs = 15000;
-constexpr uint32_t kModUpdateInterRequestDelayMs = 250;
+constexpr uint32_t kStartupGateWaitTimeoutMs = 5000;
 constexpr size_t kPromptAnnouncementMaxChars = 120;
 
 struct SimpleVersion {
@@ -1054,10 +1053,115 @@ std::optional<ModUpdateCheckResult> check_single_mod_update(const ModMetadataRec
     return result;
 }
 
-void run_loader_update_check_worker_body() {
+StartupGateStatus load_startup_gate_status() {
+    return static_cast<StartupGateStatus>(g_startup_gate_status.load());
+}
+
+bool publish_startup_gate_result(
+    StartupGateStatus status,
+    StartupGateSnapshot snapshot,
+    const std::optional<VirtualPakLoaderConfig>& config_override,
+    const char* reason) {
+    int expected = static_cast<int>(StartupGateStatus::Pending);
+    if (!g_startup_gate_status.compare_exchange_strong(expected, static_cast<int>(status))) {
+        std::ostringstream oss;
+        oss << "startup-gate-publish-skipped reason=" << (reason != nullptr ? reason : "<null>")
+            << " observed_status=" << g_startup_gate_status.load()
+            << "\n";
+        append_log_line(oss.str());
+        return false;
+    }
+
+    {
+        std::scoped_lock _{g_startup_gate_mutex};
+        g_startup_gate_snapshot = std::move(snapshot);
+    }
+
+    if (config_override.has_value()) {
+        std::scoped_lock _{g_virtual_loader_mutex};
+        g_virtual_loader_config = *config_override;
+    }
+
+    if (g_startup_gate_ready_event != nullptr) {
+        SetEvent(g_startup_gate_ready_event);
+    }
+
+    std::ostringstream oss;
+    oss << "startup-gate-published"
+        << " status=" << static_cast<int>(status)
+        << " reason=" << (reason != nullptr ? reason : "<null>")
+        << "\n";
+    append_log_line(oss.str());
+    return true;
+}
+
+StartupGateStatus wait_for_startup_gate_status(const char* consumer) {
+    const auto current_status = load_startup_gate_status();
+    if (current_status != StartupGateStatus::Pending) {
+        return current_status;
+    }
+
+    if (!g_startup_gate_wait_logged.exchange(true)) {
+        std::ostringstream timing_oss;
+        timing_oss << "consumer=" << (consumer != nullptr ? consumer : "<null>")
+            << " timeout_ms=" << kStartupGateWaitTimeoutMs;
+        append_timing_log_line("startup-gate-wait-begin", timing_oss.str());
+    }
+
+    if (g_startup_gate_ready_event == nullptr) {
+        StartupGateSnapshot snapshot{};
+        publish_startup_gate_result(StartupGateStatus::TimeoutFallback, std::move(snapshot), std::nullopt, "event_missing");
+        return load_startup_gate_status();
+    }
+
+    const auto wait_result = WaitForSingleObject(g_startup_gate_ready_event, kStartupGateWaitTimeoutMs);
+    if (wait_result == WAIT_OBJECT_0) {
+        std::ostringstream timing_oss;
+        timing_oss << "consumer=" << (consumer != nullptr ? consumer : "<null>")
+            << " status=" << g_startup_gate_status.load();
+        append_timing_log_line("startup-gate-wait-end", timing_oss.str());
+        return load_startup_gate_status();
+    }
+
+    if (wait_result == WAIT_TIMEOUT) {
+        StartupGateSnapshot snapshot{};
+        publish_startup_gate_result(StartupGateStatus::TimeoutFallback, std::move(snapshot), std::nullopt, "wait_timeout");
+        append_timing_log_line("startup-gate-timeout", consumer != nullptr ? consumer : "<null>");
+        return load_startup_gate_status();
+    }
+
+    StartupGateSnapshot snapshot{};
+    publish_startup_gate_result(StartupGateStatus::TimeoutFallback, std::move(snapshot), std::nullopt, "wait_failed");
+    append_log_line("startup-gate-wait-failed\n");
+    return load_startup_gate_status();
+}
+
+void log_mod_gate_denial(std::wstring_view source_path, const char* reason, std::wstring_view detail = {}) {
+    std::ostringstream oss;
+    oss << "mod-gate-denied source=" << narrow_utf8(std::wstring{source_path})
+        << " reason=" << (reason != nullptr ? reason : "<null>");
+    if (!detail.empty()) {
+        oss << " detail=" << narrow_utf8(std::wstring{detail});
+    }
+    oss << "\n";
+    append_log_line(oss.str());
+}
+
+std::optional<VirtualPakLoaderConfig> build_gate_ready_config(const StartupGateSnapshot& snapshot) {
+    VirtualPakLoaderConfig config{};
+    {
+        std::scoped_lock _{g_virtual_loader_mutex};
+        config = g_virtual_loader_config;
+    }
+
+    config.encrypted_mod_staged_count = static_cast<int>(snapshot.staged_encrypted_paths.size());
+    recompute_virtual_loader_patch_counts(config);
+    return config;
+}
+
+std::optional<RemoteUpdateInfo> fetch_loader_remote_update_info_once() {
     append_timing_log_line("loader-update-worker-start");
     const auto local_version = parse_simple_version(kLoaderBuildVersion);
-    std::set<std::string> prompted_versions{};
     std::optional<RemoteUpdateInfo> cached_info{};
 
     if (const auto cached = load_loader_update_cache_record(); cached.has_value()) {
@@ -1071,58 +1175,62 @@ void run_loader_update_check_worker_body() {
         }
     }
 
-    const auto try_prompt_cached_info = [&](const char* reason) {
-        if (!cached_info.has_value() || prompted_versions.contains(cached_info->remote_version)) {
-            return;
+    const auto remote_info = fetch_remote_update_info_from_caimogu_post_url(kLoaderUpdatePostUrl);
+    if (!remote_info.has_value()) {
+        if (cached_info.has_value()) {
+            enqueue_update_prompt_request(build_loader_update_prompt_request(*cached_info));
+            std::ostringstream oss;
+            oss << "loader-update-cache-fallback reason=api_failed"
+                << " remote=" << cached_info->remote_version << "\n";
+            append_log_line(oss.str());
         }
 
-        enqueue_update_prompt_request(build_loader_update_prompt_request(*cached_info));
-        prompted_versions.insert(cached_info->remote_version);
-
-        std::ostringstream oss;
-        oss << "loader-update-cache-fallback reason=" << reason
-            << " remote=" << cached_info->remote_version << "\n";
-        append_log_line(oss.str());
-    };
-
-    while (!g_shutdown_requested.load()) {
-        const auto remote_info = fetch_remote_update_info_from_caimogu_post_url(kLoaderUpdatePostUrl);
-        if (!remote_info.has_value()) {
-            try_prompt_cached_info("api_failed");
-            append_log_line("loader-update-api-failed\n");
-            std::this_thread::sleep_for(std::chrono::milliseconds(kLoaderUpdateRetryDelayMs));
-            continue;
-        }
-
-        LoaderUpdateCacheRecord cache_record{};
-        cache_record.remote_version = remote_info->remote_version;
-        cache_record.announcement = remote_info->announcement;
-        cache_record.source_url = remote_info->source_url;
-        cache_record.last_checked_unix_seconds = static_cast<int64_t>(std::time(nullptr));
-        save_loader_update_cache_record(cache_record);
-
-        std::ostringstream oss;
-        oss << "loader-update-remote-version local=" << kLoaderBuildVersion
-            << " remote=" << remote_info->remote_version << "\n";
-        append_log_line(oss.str());
-
-        if (const auto remote_version = parse_simple_version(remote_info->remote_version);
-            local_version.has_value() && remote_version.has_value() && compare_simple_version(*remote_version, *local_version) > 0 &&
-            !prompted_versions.contains(remote_info->remote_version)) {
-            enqueue_update_prompt_request(build_loader_update_prompt_request(*remote_info));
-            prompted_versions.insert(remote_info->remote_version);
-        }
-
-        {
-            std::ostringstream timing_oss;
-            timing_oss << "remote=" << remote_info->remote_version;
-            append_timing_log_line("loader-update-worker-finished", timing_oss.str());
-        }
-        return;
+        append_log_line("loader-update-api-failed\n");
+        append_timing_log_line("loader-update-worker-finished", "status=api_failed");
+        return std::nullopt;
     }
+
+    LoaderUpdateCacheRecord cache_record{};
+    cache_record.remote_version = remote_info->remote_version;
+    cache_record.announcement = remote_info->announcement;
+    cache_record.source_url = remote_info->source_url;
+    cache_record.last_checked_unix_seconds = static_cast<int64_t>(std::time(nullptr));
+    save_loader_update_cache_record(cache_record);
+
+    std::ostringstream oss;
+    oss << "loader-update-remote-version local=" << kLoaderBuildVersion
+        << " remote=" << remote_info->remote_version << "\n";
+    append_log_line(oss.str());
+
+    if (const auto remote_version = parse_simple_version(remote_info->remote_version);
+        local_version.has_value() && remote_version.has_value() && compare_simple_version(*remote_version, *local_version) > 0) {
+        enqueue_update_prompt_request(build_loader_update_prompt_request(*remote_info));
+    }
+
+    std::ostringstream timing_oss;
+    timing_oss << "remote=" << remote_info->remote_version;
+    append_timing_log_line("loader-update-worker-finished", timing_oss.str());
+    return remote_info;
 }
 
-void run_mod_update_check_worker_body() {
+void run_startup_gate_worker_body() {
+    auto remote_info = fetch_loader_remote_update_info_once();
+    if (!remote_info.has_value()) {
+        StartupGateSnapshot snapshot{};
+        publish_startup_gate_result(StartupGateStatus::TimeoutFallback, std::move(snapshot), std::nullopt, "loader_api_failed");
+        return;
+    }
+
+    StartupGateSnapshot snapshot{};
+    snapshot.loader_remote_version = remote_info->remote_version;
+    if (const auto local_version = parse_simple_version(kLoaderBuildVersion);
+        local_version.has_value()) {
+        if (const auto remote_version = parse_simple_version(remote_info->remote_version);
+            remote_version.has_value() && compare_simple_version(*remote_version, *local_version) > 0) {
+            snapshot.loader_soft_outdated = true;
+        }
+    }
+
     const auto mod_paths = resolve_encrypted_custom_mod_paths();
     std::vector<ModUpdateCheckResult> outdated_results{};
     outdated_results.reserve(mod_paths.size());
@@ -1134,7 +1242,7 @@ void run_mod_update_check_worker_body() {
     }
 
     std::ostringstream begin_oss;
-    begin_oss << "mod-update-begin count=" << mod_paths.size() << "\n";
+    begin_oss << "mod-gate-begin count=" << mod_paths.size() << "\n";
     append_log_line(begin_oss.str());
 
     for (size_t index = 0; index < mod_paths.size(); ++index) {
@@ -1145,67 +1253,103 @@ void run_mod_update_check_worker_body() {
         const std::filesystem::path source_path{mod_paths[index]};
         const auto metadata = load_mod_metadata_record(source_path);
         if (!metadata.has_value()) {
+            snapshot.denied_encrypted_source_paths.emplace_back(source_path.wstring());
+            log_mod_gate_denial(source_path.wstring(), "metadata_open_failed");
             continue;
         }
 
         if (!metadata->metadata_present) {
-            std::ostringstream oss;
-            oss << "mod-update-skip-no-metadata source=" << narrow_utf8(metadata->source_path) << "\n";
-            append_log_line(oss.str());
+            snapshot.denied_encrypted_source_paths.emplace_back(metadata->source_path);
+            log_mod_gate_denial(metadata->source_path, "metadata_missing");
             continue;
         }
 
         if (!metadata->authenticated) {
-            std::ostringstream oss;
-            oss << "mod-update-skip-unauthenticated source=" << narrow_utf8(metadata->source_path) << "\n";
-            append_log_line(oss.str());
+            snapshot.denied_encrypted_source_paths.emplace_back(metadata->source_path);
+            log_mod_gate_denial(metadata->source_path, "metadata_unauthenticated");
             continue;
         }
 
         if (metadata->mod_version.empty() || metadata->update_url.empty()) {
-            std::ostringstream oss;
-            oss << "mod-update-skip-incomplete source=" << narrow_utf8(metadata->source_path)
-                << " version=" << narrow_utf8(metadata->mod_version)
-                << " url=" << narrow_utf8(metadata->update_url) << "\n";
-            append_log_line(oss.str());
+            snapshot.denied_encrypted_source_paths.emplace_back(metadata->source_path);
+            log_mod_gate_denial(metadata->source_path, "metadata_incomplete");
             continue;
         }
 
-        if (const auto result = check_single_mod_update(*metadata); result.has_value()) {
-            outdated_results.emplace_back(*result);
+        const auto remote_mod_info = fetch_remote_update_info_from_caimogu_post_url(metadata->update_url);
+        if (!remote_mod_info.has_value()) {
+            snapshot.denied_encrypted_source_paths.emplace_back(metadata->source_path);
+            log_mod_gate_denial(metadata->source_path, "update_api_failed", metadata->update_url);
+            continue;
         }
 
-        if (index + 1 < mod_paths.size()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(kModUpdateInterRequestDelayMs));
+        const auto local_version = parse_simple_version(metadata->mod_version);
+        const auto remote_version = parse_simple_version(remote_mod_info->remote_version);
+        if (!local_version.has_value() || !remote_version.has_value()) {
+            snapshot.denied_encrypted_source_paths.emplace_back(metadata->source_path);
+            log_mod_gate_denial(metadata->source_path, "version_parse_failed");
+            continue;
         }
+
+        if (compare_simple_version(*remote_version, *local_version) > 0) {
+            ModUpdateCheckResult result{};
+            result.metadata = *metadata;
+            result.remote_version = remote_mod_info->remote_version;
+            result.announcement = remote_mod_info->announcement;
+            outdated_results.emplace_back(std::move(result));
+            snapshot.denied_encrypted_source_paths.emplace_back(metadata->source_path);
+            log_mod_gate_denial(metadata->source_path, "remote_outdated");
+            continue;
+        }
+
+        snapshot.approved_encrypted_source_paths.emplace_back(metadata->source_path);
+
+        std::ostringstream oss;
+        oss << "mod-gate-approved source=" << narrow_utf8(metadata->source_path)
+            << " local=" << narrow_utf8(metadata->mod_version)
+            << " remote=" << remote_mod_info->remote_version
+            << "\n";
+        append_log_line(oss.str());
+
     }
 
-    if (outdated_results.empty()) {
+    if (!outdated_results.empty()) {
+        enqueue_update_prompt_request(build_mod_update_prompt_request(outdated_results));
+
+        std::ostringstream oss;
+        oss << "mod-update-summary count=" << outdated_results.size() << "\n";
+        append_log_line(oss.str());
+    } else {
         append_log_line("mod-update-none\n");
-        append_timing_log_line("mod-update-worker-finished", "outdated_count=0");
-        return;
     }
 
-    enqueue_update_prompt_request(build_mod_update_prompt_request(outdated_results));
-
-    std::ostringstream oss;
-    oss << "mod-update-summary count=" << outdated_results.size() << "\n";
-    append_log_line(oss.str());
+    if (load_startup_gate_status() == StartupGateStatus::Pending) {
+        VirtualPakLoaderConfig config{};
+        {
+            std::scoped_lock _{g_virtual_loader_mutex};
+            config = g_virtual_loader_config;
+        }
+        snapshot.staged_encrypted_paths =
+            stage_selected_encrypted_mods_into_local_dir(config, snapshot.approved_encrypted_source_paths);
+    }
 
     {
         std::ostringstream timing_oss;
-        timing_oss << "outdated_count=" << outdated_results.size();
+        timing_oss << "outdated_count=" << outdated_results.size()
+            << " approved_count=" << snapshot.approved_encrypted_source_paths.size()
+            << " staged_count=" << snapshot.staged_encrypted_paths.size();
         append_timing_log_line("mod-update-worker-finished", timing_oss.str());
     }
+
+    publish_startup_gate_result(
+        StartupGateStatus::Ready,
+        snapshot,
+        build_gate_ready_config(snapshot),
+        "ready");
 }
 
-DWORD WINAPI loader_update_check_thread_proc(LPVOID) {
-    run_loader_update_check_worker_body();
-    return 0;
-}
-
-DWORD WINAPI mod_update_check_thread_proc(LPVOID) {
-    run_mod_update_check_worker_body();
+DWORD WINAPI startup_gate_thread_proc(LPVOID) {
+    run_startup_gate_worker_body();
     return 0;
 }
 
@@ -1216,25 +1360,15 @@ void schedule_update_check_worker() {
 
     append_timing_log_line("update-check-schedule");
 
-    bool loader_thread_ok = false;
-    bool mod_thread_ok = false;
-    if (const auto loader_thread = CreateThread(nullptr, 0, &loader_update_check_thread_proc, nullptr, 0, nullptr); loader_thread != nullptr) {
-        CloseHandle(loader_thread);
-        loader_thread_ok = true;
-    } else {
-        append_log_line("loader-update-thread-create-failed\n");
+    if (const auto worker_thread = CreateThread(nullptr, 0, &startup_gate_thread_proc, nullptr, 0, nullptr); worker_thread != nullptr) {
+        CloseHandle(worker_thread);
+        return;
     }
 
-    if (const auto mod_thread = CreateThread(nullptr, 0, &mod_update_check_thread_proc, nullptr, 0, nullptr); mod_thread != nullptr) {
-        CloseHandle(mod_thread);
-        mod_thread_ok = true;
-    } else {
-        append_log_line("mod-update-thread-create-failed\n");
-    }
-
-    if (!loader_thread_ok && !mod_thread_ok) {
-        g_update_check_thread_started = false;
-    }
+    append_log_line("startup-gate-thread-create-failed\n");
+    StartupGateSnapshot snapshot{};
+    publish_startup_gate_result(StartupGateStatus::TimeoutFallback, std::move(snapshot), std::nullopt, "thread_create_failed");
+    g_update_check_thread_started = false;
 }
 #endif
 

@@ -2,7 +2,6 @@
 
 using namespace mhwilds::probe;
 
-#if defined(MHWILDS_VERSION_PROXY)
 namespace {
 using GetFileVersionInfoAFn = decltype(&::GetFileVersionInfoA);
 using GetFileVersionInfoExAFn = decltype(&::GetFileVersionInfoExA);
@@ -108,32 +107,6 @@ DEFINE_VERSION_PROXY_BOOL_EXPORT(VerQueryValueW, (LPCVOID block, LPCWSTR sub_blo
 
 #undef DEFINE_VERSION_PROXY_BOOL_EXPORT
 #undef DEFINE_VERSION_PROXY_DWORD_EXPORT
-#endif
-
-#if !defined(MHWILDS_VERSION_PROXY)
-extern "C" __declspec(dllexport) void reframework_plugin_required_version(REFrameworkPluginVersion* version) {
-    version->major = REFRAMEWORK_PLUGIN_VERSION_MAJOR;
-    version->minor = REFRAMEWORK_PLUGIN_VERSION_MINOR;
-    version->patch = REFRAMEWORK_PLUGIN_VERSION_PATCH;
-    version->game_name = "MHWILDS";
-}
-
-extern "C" __declspec(dllexport) bool reframework_plugin_initialize(const REFrameworkPluginInitializeParam* param) {
-    if (param == nullptr || param->functions == nullptr) {
-        return false;
-    }
-
-    g_ref = *param->functions;
-    run_probe_installation("initialize-result", false);
-    const auto directstorage_ok = g_directstorage_hook_installed.load();
-
-    if (!directstorage_ok && g_ref.on_present != nullptr && !g_retry_registered.exchange(true)) {
-        g_ref.on_present(&try_install_directstorage_once_on_present);
-    }
-
-    return true;
-}
-#endif
 
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
     (void)reserved;
@@ -141,12 +114,10 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         g_shutdown_requested = false;
         DisableThreadLibraryCalls(module);
-#if defined(MHWILDS_VERSION_PROXY)
         g_version_proxy_real_module = ensure_real_version_module_loaded();
         if (g_version_proxy_real_module == nullptr) {
             return FALSE;
         }
-#endif
         run_early_create_file_bootstrap();
         if (!g_attach_thread_started.exchange(true)) {
             if (const auto thread = CreateThread(nullptr, 0, &attach_probe_thread, nullptr, 0, nullptr); thread != nullptr) {
@@ -159,12 +130,10 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
     } else if (reason == DLL_PROCESS_DETACH) {
         g_shutdown_requested = true;
         shutdown_hooks();
-#if defined(MHWILDS_VERSION_PROXY)
         if (g_version_proxy_real_module != nullptr) {
             FreeLibrary(g_version_proxy_real_module);
             g_version_proxy_real_module = nullptr;
         }
-#endif
     }
 
     return TRUE;

@@ -13,10 +13,7 @@ The current goal is narrow:
 - Install our own same-point hooks on the patch-version and pak-open call sites.
 - Map `reframework\pak_mods` first, then append our own pak paths after that.
 
-This project is not a REFramework fork. It is a separate DLL project that can be deployed either as:
-
-- `version.dll` proxy loaded by the game at process start.
-- `mhwilds_file_open_probe.dll` REFramework plugin build for lighter experiments.
+This project is not a REFramework fork. It is a separate `version.dll` proxy loaded by the game at process start.
 
 ## Current Status
 
@@ -49,7 +46,7 @@ The loader code is now a normal multi-translation-unit C++ layout. `src/plugin.c
 
 - `src/plugin.cpp`
   - Thin entry / export file.
-  - Holds the `version.dll` proxy exports, REFramework plugin exports, and `DllMain`.
+  - Holds the `version.dll` proxy exports and `DllMain`.
 - `src/plugin/plugin_internal.hpp`
   - Shared internal declarations for the loader.
   - Centralizes common includes, constants, structs, globals, and cross-module function declarations.
@@ -85,7 +82,7 @@ The loader code is now a normal multi-translation-unit C++ layout. `src/plugin.c
 
 The refactor is structural and behavioral: the old `inl` aggregation has been removed, and the project now builds as real `h + cpp` translation units.
 
-## Build## Build
+## Build
 
 ```powershell
 cmake -S G:\MHWILDS_FileOpenProbe -B G:\MHWILDS_FileOpenProbe\build -G "Visual Studio 17 2022" -A x64
@@ -95,7 +92,6 @@ cmake --build G:\MHWILDS_FileOpenProbe\build --config Release
 Build outputs:
 
 - `build\Release\version.dll`
-- `build\Release\mhwilds_file_open_probe.dll`
 - `build\Release\mhwilds_pak_packer.exe`
 
 Author-side packager frontend:

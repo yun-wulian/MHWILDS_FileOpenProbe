@@ -36,6 +36,9 @@ void run_probe_installation(const char* source, bool directstorage_retry_loop) {
     open_log_if_needed();
     reload_virtual_loader_config();
     initialize_fixed_addresses();
+#if defined(MHWILDS_VERSION_PROXY)
+    schedule_update_check_worker();
+#endif
 
     VirtualPakLoaderConfig config{};
     {
@@ -125,9 +128,6 @@ void run_probe_installation(const char* source, bool directstorage_retry_loop) {
 DWORD WINAPI attach_probe_thread(LPVOID) {
     run_probe_installation("attach-init-result", true);
 #if defined(MHWILDS_VERSION_PROXY)
-    schedule_update_check_worker();
-#endif
-#if defined(MHWILDS_VERSION_PROXY)
     run_hw_trace_reapply_loop();
 #endif
     return 0;
@@ -141,6 +141,9 @@ void run_early_create_file_bootstrap() {
     open_log_if_needed();
     reload_virtual_loader_config();
     initialize_fixed_addresses();
+#if defined(MHWILDS_VERSION_PROXY)
+    schedule_update_check_worker();
+#endif
 
     VirtualPakLoaderConfig config{};
     {

@@ -24,6 +24,7 @@ std::ofstream g_trace_log{};
 std::mutex g_stage_session_mutex{};
 std::mutex g_encrypted_mod_stage_mutex{};
 std::mutex g_update_prompt_mutex{};
+std::mutex g_startup_gate_mutex{};
 std::atomic<uint64_t> g_sequence{0};
 std::atomic<bool> g_retry_registered{false};
 std::atomic<bool> g_create_file_hook_installed{false};
@@ -50,6 +51,8 @@ std::atomic<uint64_t> g_directstorage_hits{0};
 std::atomic<uint64_t> g_redirect_createfile_breakpoint_hits{0};
 std::atomic<bool> g_same_point_hooks_installed{false};
 std::atomic<bool> g_encrypted_mod_stage_prepared{false};
+std::atomic<int> g_startup_gate_status{static_cast<int>(StartupGateStatus::Pending)};
+std::atomic<bool> g_startup_gate_wait_logged{false};
 
 uintptr_t g_game_module_base{};
 void* g_create_file_target{};
@@ -83,6 +86,7 @@ VirtualPakLoaderConfig g_virtual_loader_config{};
 VirtualPakPayloadCache g_virtual_payload_cache{};
 VirtualPakStageCache g_virtual_stage_cache{};
 EncryptedModStageCache g_encrypted_mod_stage_cache{};
+StartupGateSnapshot g_startup_gate_snapshot{};
 std::wstring g_shared_stage_session_dir{};
 bool g_stage_startup_cleanup_done{};
 std::optional<std::array<uint8_t, 32>> g_cached_game_key{};
@@ -92,6 +96,7 @@ std::wstring g_cached_game_fingerprint_source{};
 std::deque<UpdatePromptRequest> g_pending_update_prompts{};
 std::atomic<uint64_t> g_virtual_handle_counter{1};
 uint64_t g_process_start_tick_ms{static_cast<uint64_t>(GetTickCount64())};
+HANDLE g_startup_gate_ready_event{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
 
 #if defined(MHWILDS_VERSION_PROXY)
 HMODULE g_version_proxy_real_module{};

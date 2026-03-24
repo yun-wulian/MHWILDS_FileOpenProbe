@@ -48,15 +48,9 @@
 
 namespace mhwilds::probe {
 
-#if defined(MHWILDS_VERSION_PROXY)
 inline constexpr wchar_t kLogRelativePath[] = L"mhwilds_version_proxy.log";
 inline constexpr wchar_t kTraceLogRelativePath[] = L"mhwilds_instruction_trace.log";
 inline constexpr wchar_t kLoaderConfigRelativePath[] = L"mhwilds_virtual_pak_loader.ini";
-#else
-inline constexpr wchar_t kLogRelativePath[] = L"reframework\\plugins\\mhwilds_file_open_probe.log";
-inline constexpr wchar_t kTraceLogRelativePath[] = L"reframework\\plugins\\mhwilds_instruction_trace.log";
-inline constexpr wchar_t kLoaderConfigRelativePath[] = L"reframework\\plugins\\mhwilds_virtual_pak_loader.ini";
-#endif
 
 inline constexpr wchar_t kFocusPakPathFragment[] = L"\\pak_mods\\";
 inline constexpr wchar_t kEncryptedModExtension[] = L".mhwsmod";
@@ -209,6 +203,21 @@ struct ModUpdateCheckResult {
     std::string announcement{};
 };
 
+enum class StartupGateStatus : int {
+    Pending = 0,
+    Ready = 1,
+    TimeoutFallback = 2,
+    LoaderHardBlocked = 3,
+};
+
+struct StartupGateSnapshot {
+    bool loader_soft_outdated{};
+    std::string loader_remote_version{};
+    std::vector<std::wstring> approved_encrypted_source_paths{};
+    std::vector<std::wstring> denied_encrypted_source_paths{};
+    std::vector<std::wstring> staged_encrypted_paths{};
+};
+
 struct RedirectPathBreakpointSite {
     uintptr_t addr{};
     uint8_t original_byte{};
@@ -254,6 +263,7 @@ extern std::ofstream g_trace_log;
 extern std::mutex g_stage_session_mutex;
 extern std::mutex g_encrypted_mod_stage_mutex;
 extern std::mutex g_update_prompt_mutex;
+extern std::mutex g_startup_gate_mutex;
 extern std::atomic<uint64_t> g_sequence;
 extern std::atomic<bool> g_retry_registered;
 extern std::atomic<bool> g_create_file_hook_installed;
@@ -280,6 +290,8 @@ extern std::atomic<uint64_t> g_directstorage_hits;
 extern std::atomic<uint64_t> g_redirect_createfile_breakpoint_hits;
 extern std::atomic<bool> g_same_point_hooks_installed;
 extern std::atomic<bool> g_encrypted_mod_stage_prepared;
+extern std::atomic<int> g_startup_gate_status;
+extern std::atomic<bool> g_startup_gate_wait_logged;
 
 extern uintptr_t g_game_module_base;
 extern void* g_create_file_target;
@@ -313,6 +325,7 @@ extern VirtualPakLoaderConfig g_virtual_loader_config;
 extern VirtualPakPayloadCache g_virtual_payload_cache;
 extern VirtualPakStageCache g_virtual_stage_cache;
 extern EncryptedModStageCache g_encrypted_mod_stage_cache;
+extern StartupGateSnapshot g_startup_gate_snapshot;
 extern std::wstring g_shared_stage_session_dir;
 extern bool g_stage_startup_cleanup_done;
 extern std::optional<std::array<uint8_t, 32>> g_cached_game_key;
@@ -322,6 +335,7 @@ extern std::wstring g_cached_game_fingerprint_source;
 extern std::deque<UpdatePromptRequest> g_pending_update_prompts;
 extern std::atomic<uint64_t> g_virtual_handle_counter;
 extern uint64_t g_process_start_tick_ms;
+extern HANDLE g_startup_gate_ready_event;
 
 #if defined(MHWILDS_VERSION_PROXY)
 extern HMODULE g_version_proxy_real_module;
@@ -417,11 +431,16 @@ void uninstall_hw_instruction_trace();
 bool load_reframework_pak_directory_enabled_from_disk();
 std::vector<std::wstring> resolve_encrypted_custom_mod_paths();
 std::vector<std::wstring> resolve_local_custom_pak_paths(const VirtualPakLoaderConfig& config);
+int count_candidate_virtual_source_paths(const VirtualPakLoaderConfig& config);
 int count_effective_virtual_source_paths(const VirtualPakLoaderConfig& config);
+void recompute_virtual_loader_patch_counts(VirtualPakLoaderConfig& config);
 std::vector<std::wstring> resolve_effective_rf_chain_pak_paths(const VirtualPakLoaderConfig& config);
 void reload_virtual_loader_config();
 std::optional<std::vector<uint8_t>> read_binary_file(const std::filesystem::path& path);
 bool write_binary_file(const std::filesystem::path& path, const std::vector<uint8_t>& bytes);
+std::vector<std::wstring> stage_selected_encrypted_mods_into_local_dir(
+    const VirtualPakLoaderConfig& config,
+    const std::vector<std::wstring>& encrypted_source_paths);
 std::vector<std::wstring> stage_encrypted_custom_mods_into_local_dir(const VirtualPakLoaderConfig& config);
 std::optional<std::shared_ptr<std::vector<uint8_t>>> load_virtual_pak_payload();
 std::optional<std::wstring> ensure_runtime_source_path_prepared();
@@ -516,6 +535,7 @@ DWORD WINAPI attach_probe_thread(LPVOID);
 void run_early_create_file_bootstrap();
 void try_install_directstorage_once_on_present();
 void shutdown_hooks();
+StartupGateStatus wait_for_startup_gate_status(const char* consumer);
 void schedule_update_check_worker();
 
 inline ScopedInternalBackendOpen::ScopedInternalBackendOpen() {

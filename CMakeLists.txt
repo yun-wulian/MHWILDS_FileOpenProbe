@@ -36,11 +36,6 @@ set(PROBE_PLUGIN_IMPL_FILES
     src/plugin/70_update_check.cpp
 )
 
-add_library(MHWILDSFileOpenProbe SHARED
-    src/plugin.cpp
-    ${PROBE_PLUGIN_IMPL_FILES}
-)
-
 add_library(MHWILDSVersionProxy SHARED
     src/plugin.cpp
     src/version_proxy.def
@@ -49,14 +44,6 @@ add_library(MHWILDSVersionProxy SHARED
 
 add_executable(MHWILDSPakPacker
     src/packer.cpp
-)
-
-target_compile_definitions(MHWILDSFileOpenProbe PRIVATE
-    NOMINMAX
-    WIN32_LEAN_AND_MEAN
-    UNICODE
-    _UNICODE
-    MHWILDS_LOADER_VERSION="${MHWILDS_LOADER_VERSION}"
 )
 
 target_compile_definitions(MHWILDSVersionProxy PRIVATE
@@ -68,11 +55,6 @@ target_compile_definitions(MHWILDSVersionProxy PRIVATE
     MHWILDS_LOADER_VERSION="${MHWILDS_LOADER_VERSION}"
 )
 
-target_include_directories(MHWILDSFileOpenProbe PRIVATE
-    include
-    ${JSON_INCLUDE_DIR}
-)
-
 target_include_directories(MHWILDSVersionProxy PRIVATE
     include
     ${JSON_INCLUDE_DIR}
@@ -81,14 +63,6 @@ target_include_directories(MHWILDSVersionProxy PRIVATE
 target_include_directories(MHWILDSPakPacker PRIVATE
     include
     ${JSON_INCLUDE_DIR}
-)
-
-target_link_libraries(MHWILDSFileOpenProbe PRIVATE
-    comctl32
-    minhook
-    safetyhook::safetyhook
-    bcrypt
-    winhttp
 )
 
 target_link_libraries(MHWILDSVersionProxy PRIVATE
@@ -103,10 +77,6 @@ target_link_libraries(MHWILDSPakPacker PRIVATE
     bcrypt
 )
 
-set_target_properties(MHWILDSFileOpenProbe PROPERTIES
-    OUTPUT_NAME "mhwilds_file_open_probe"
-)
-
 set_target_properties(MHWILDSVersionProxy PROPERTIES
     OUTPUT_NAME "version"
 )
@@ -116,13 +86,6 @@ set_target_properties(MHWILDSPakPacker PROPERTIES
 )
 
 if(MHWILDS_GAME_DIR)
-    add_custom_command(TARGET MHWILDSFileOpenProbe POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E make_directory "${MHWILDS_GAME_DIR}/reframework/plugins"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "$<TARGET_FILE:MHWILDSFileOpenProbe>"
-            "${MHWILDS_GAME_DIR}/reframework/plugins/$<TARGET_FILE_NAME:MHWILDSFileOpenProbe>"
-    )
-
     add_custom_command(TARGET MHWILDSVersionProxy POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "$<TARGET_FILE:MHWILDSVersionProxy>"

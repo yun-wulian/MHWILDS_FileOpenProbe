@@ -71,10 +71,6 @@ std::filesystem::path reframework_runtime_config_path() {
     return std::filesystem::current_path() / L"re2_fw_config.txt";
 }
 
-std::filesystem::path default_custom_test_pak_dir() {
-    return std::filesystem::current_path() / L"test_pak";
-}
-
 bool load_reframework_pak_directory_enabled_from_disk() {
     const auto config_path = reframework_runtime_config_path();
     if (!std::filesystem::exists(config_path)) {
@@ -128,37 +124,8 @@ std::vector<std::wstring> resolve_encrypted_custom_mod_paths() {
 }
 
 std::vector<std::wstring> resolve_local_custom_pak_paths(const VirtualPakLoaderConfig& config) {
-    auto filter_paths = [](std::vector<std::wstring> paths) {
-        std::erase_if(paths, [](const std::wstring& path) {
-            return normalize_path_for_match(path).find(L"\\mhwsmod_cache\\") != std::wstring::npos;
-        });
-        return paths;
-    };
-
-    if (!config.source_path.empty()) {
-        const std::filesystem::path source_path{config.source_path};
-        std::error_code ec{};
-        if (std::filesystem::is_directory(source_path, ec) && !ec) {
-            return filter_paths(scan_pak_files_in_directory(source_path));
-        }
-
-        if (!ec && std::filesystem::is_regular_file(source_path, ec) && !ec) {
-            auto extension = source_path.extension().wstring();
-            std::transform(extension.begin(), extension.end(), extension.begin(), [](wchar_t ch) {
-                return static_cast<wchar_t>(std::towlower(ch));
-            });
-
-            if (extension == L".pak") {
-                return {source_path.wstring()};
-            }
-        }
-    }
-
-    if (!config.custom_pak_dir.empty()) {
-        return filter_paths(scan_pak_files_in_directory(std::filesystem::path{config.custom_pak_dir}));
-    }
-
-    return filter_paths(scan_pak_files_in_directory(default_custom_test_pak_dir()));
+    (void)config;
+    return {};
 }
 
 int count_effective_virtual_source_paths(const VirtualPakLoaderConfig& config) {
@@ -167,6 +134,28 @@ int count_effective_virtual_source_paths(const VirtualPakLoaderConfig& config) {
     }
 
     return config.custom_source_count + config.encrypted_mod_staged_count;
+}
+
+int count_candidate_virtual_source_paths(const VirtualPakLoaderConfig& config) {
+    if (config.rf_chain_mode) {
+        return config.reframework_source_count + config.custom_source_count + config.encrypted_mod_source_count;
+    }
+
+    return config.custom_source_count + config.encrypted_mod_source_count;
+}
+
+void recompute_virtual_loader_patch_counts(VirtualPakLoaderConfig& config) {
+    config.total_patch_num = -1;
+    const auto effective_source_count = count_effective_virtual_source_paths(config);
+    if (config.base_patch_num >= 0 && effective_source_count > 0) {
+        config.total_patch_num = config.base_patch_num + effective_source_count;
+    }
+
+    if (config.target_patch_num >= 0) {
+        config.total_patch_num = std::max(config.total_patch_num, config.target_patch_num);
+    } else if (config.total_patch_num >= 0) {
+        config.target_patch_num = config.total_patch_num;
+    }
 }
 
 std::vector<std::wstring> resolve_effective_rf_chain_pak_paths(const VirtualPakLoaderConfig& config) {
@@ -291,33 +280,24 @@ VirtualPakLoaderConfig load_virtual_loader_config_from_disk() {
     config.reframework_pak_dir_enabled = load_reframework_pak_directory_enabled_from_disk();
     const auto reframework_custom_paths = resolve_reframework_custom_pak_paths(config.reframework_pak_dir_enabled);
     const auto encrypted_custom_paths = resolve_encrypted_custom_mod_paths();
-    const auto staged_encrypted_paths = stage_encrypted_custom_mods_into_local_dir(config);
     const auto local_custom_paths = resolve_local_custom_pak_paths(config);
     config.reframework_source_count = static_cast<int>(reframework_custom_paths.size());
     config.custom_source_count = static_cast<int>(local_custom_paths.size());
     config.encrypted_mod_source_count = static_cast<int>(encrypted_custom_paths.size());
-    config.encrypted_mod_staged_count = static_cast<int>(staged_encrypted_paths.size());
-    const auto effective_source_count = count_effective_virtual_source_paths(config);
+    config.encrypted_mod_staged_count = 0;
     if (const auto patch_num = extract_patch_num_from_target_path(config.target_path); patch_num.has_value()) {
         config.target_patch_num = *patch_num;
     }
 
-    if (config.base_patch_num >= 0 && effective_source_count > 0) {
-        config.total_patch_num = config.base_patch_num + effective_source_count;
-    }
-
-    if (config.target_patch_num >= 0) {
-        config.total_patch_num = std::max(config.total_patch_num, config.target_patch_num);
-    } else if (config.total_patch_num >= 0) {
-        config.target_patch_num = config.total_patch_num;
-    }
+    recompute_virtual_loader_patch_counts(config);
 
     const auto exact_target_mode = !config.target_path_normalized.empty();
     if (config.record_only) {
         if (!exact_target_mode) {
             config.enabled = false;
         }
-    } else if ((effective_source_count <= 0 && !exact_target_mode) || (!exact_target_mode && config.total_patch_num < 0)) {
+    } else if ((count_candidate_virtual_source_paths(config) <= 0 && !exact_target_mode) ||
+               (!exact_target_mode && config.base_patch_num < 0)) {
         config.enabled = false;
     }
 
@@ -1679,9 +1659,9 @@ std::optional<uint64_t> stage_encrypted_container_to_file(
     return static_cast<uint64_t>(plain_bytes->size());
 }
 
-std::vector<std::wstring> stage_encrypted_custom_mods_into_local_dir(const VirtualPakLoaderConfig& config) {
-    const auto encrypted_source_paths = resolve_encrypted_custom_mod_paths();
-
+std::vector<std::wstring> stage_selected_encrypted_mods_into_local_dir(
+    const VirtualPakLoaderConfig& config,
+    const std::vector<std::wstring>& encrypted_source_paths) {
     std::scoped_lock _{g_encrypted_mod_stage_mutex};
     if (g_encrypted_mod_stage_prepared.exchange(true)) {
         return g_encrypted_mod_stage_cache.staged_paths;
@@ -1740,6 +1720,10 @@ std::vector<std::wstring> stage_encrypted_custom_mods_into_local_dir(const Virtu
     append_log_line(oss.str());
 
     return staged_paths;
+}
+
+std::vector<std::wstring> stage_encrypted_custom_mods_into_local_dir(const VirtualPakLoaderConfig& config) {
+    return stage_selected_encrypted_mods_into_local_dir(config, resolve_encrypted_custom_mod_paths());
 }
 
 std::optional<std::shared_ptr<std::vector<uint8_t>>> load_virtual_pak_payload() {

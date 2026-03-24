@@ -328,6 +328,20 @@ std::optional<std::wstring> resolve_redirect_source_for_requested_path(std::wstr
         }
     }
 
+#if defined(MHWILDS_VERSION_PROXY)
+    if (config.rf_chain_mode && wait_for_startup_gate_status("redirect_source") == StartupGateStatus::LoaderHardBlocked) {
+        return std::nullopt;
+    }
+
+    if (config.rf_chain_mode) {
+        std::scoped_lock _{g_virtual_loader_mutex};
+        config = g_virtual_loader_config;
+        if (!config.enabled) {
+            return std::nullopt;
+        }
+    }
+#endif
+
     if (!path_matches_virtual_target_locked(normalized, config)) {
         return std::nullopt;
     }
@@ -647,6 +661,12 @@ void uninstall_patch_version_breakpoint() {
 }
 
 void same_point_patch_version_hook(SafetyHookContext& context) {
+#if defined(MHWILDS_VERSION_PROXY)
+    if (wait_for_startup_gate_status("patch_version") == StartupGateStatus::LoaderHardBlocked) {
+        return;
+    }
+#endif
+
     auto* reg = select_patch_version_register(&context, g_patch_version_source_reg);
     const auto desired_patch = compute_desired_patch_version();
     if (reg != nullptr && desired_patch >= 0 && *reg < static_cast<uint64_t>(desired_patch)) {
