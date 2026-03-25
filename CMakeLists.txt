@@ -7,6 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 set(MHWILDS_LOADER_VERSION "1.0.0" CACHE STRING "Build version string reported by the loader update check")
+option(MHWILDS_DISABLE_LOGGING "Disable runtime log file output" OFF)
 
 set(MINHOOK_DIR "F:/怪猎C++mod/无双斩连段源码/deps/minhook" CACHE PATH "Path to MinHook headers and library")
 set(JSON_INCLUDE_DIR "F:/怪猎C++mod/无双斩连段源码/deps/json" CACHE PATH "Path to nlohmann json.hpp")
@@ -54,6 +55,12 @@ target_compile_definitions(MHWILDSVersionProxy PRIVATE
     MHWILDS_VERSION_PROXY=1
     MHWILDS_LOADER_VERSION="${MHWILDS_LOADER_VERSION}"
 )
+
+if(MHWILDS_DISABLE_LOGGING)
+    target_compile_definitions(MHWILDSVersionProxy PRIVATE
+        MHWILDS_DISABLE_LOGGING=1
+    )
+endif()
 
 target_include_directories(MHWILDSVersionProxy PRIVATE
     include

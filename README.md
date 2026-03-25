@@ -89,10 +89,19 @@ cmake -S G:\MHWILDS_FileOpenProbe -B G:\MHWILDS_FileOpenProbe\build -G "Visual S
 cmake --build G:\MHWILDS_FileOpenProbe\build --config Release
 ```
 
+No-log build:
+
+```powershell
+cmake -S G:\MHWILDS_FileOpenProbe -B G:\MHWILDS_FileOpenProbe\build_nolog -G "Visual Studio 17 2022" -A x64 -DMHWILDS_DISABLE_LOGGING=ON
+cmake --build G:\MHWILDS_FileOpenProbe\build_nolog --config Release
+```
+
 Build outputs:
 
 - `build\Release\version.dll`
 - `build\Release\mhwilds_pak_packer.exe`
+- `build_nolog\Release\version.dll`
+- `build_nolog\Release\mhwilds_pak_packer.exe`
 
 Author-side packager frontend:
 
@@ -193,6 +202,7 @@ Current behavior:
   - second-stage watch trace
   - module ownership for `rip` and branch targets
   - a small stack snapshot on watch hit
+- If configured with `-DMHWILDS_DISABLE_LOGGING=ON`, the proxy does not create or write either log file.
 
 ## Confirmed REFramework Behavior
 

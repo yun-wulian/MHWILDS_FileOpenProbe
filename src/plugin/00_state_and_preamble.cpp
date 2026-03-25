@@ -213,6 +213,9 @@ uint64_t process_uptime_ms() {
 }
 
 void open_log_if_needed() {
+#if defined(MHWILDS_DISABLE_LOGGING) && MHWILDS_DISABLE_LOGGING
+    return;
+#else
     std::scoped_lock _{g_log_mutex};
 
     if (g_log.is_open()) {
@@ -230,9 +233,13 @@ void open_log_if_needed() {
 
     g_log << "\n==== MHWILDS Pak Route Probe Started ====\n";
     g_log.flush();
+#endif
 }
 
 void open_trace_log_if_needed() {
+#if defined(MHWILDS_DISABLE_LOGGING) && MHWILDS_DISABLE_LOGGING
+    return;
+#else
     std::scoped_lock _{g_trace_log_mutex};
 
     if (g_trace_log.is_open()) {
@@ -250,9 +257,14 @@ void open_trace_log_if_needed() {
 
     g_trace_log << "\n==== MHWILDS Instruction Trace Started ====\n";
     g_trace_log.flush();
+#endif
 }
 
 void append_log_line(const std::string& line) {
+#if defined(MHWILDS_DISABLE_LOGGING) && MHWILDS_DISABLE_LOGGING
+    (void)line;
+    return;
+#else
     std::scoped_lock _{g_log_mutex};
     if (!g_log.is_open()) {
         return;
@@ -260,9 +272,14 @@ void append_log_line(const std::string& line) {
 
     g_log << line;
     g_log.flush();
+#endif
 }
 
 void append_trace_log_line(const std::string& line) {
+#if defined(MHWILDS_DISABLE_LOGGING) && MHWILDS_DISABLE_LOGGING
+    (void)line;
+    return;
+#else
     std::scoped_lock _{g_trace_log_mutex};
     if (!g_trace_log.is_open()) {
         return;
@@ -270,9 +287,15 @@ void append_trace_log_line(const std::string& line) {
 
     g_trace_log << line;
     g_trace_log.flush();
+#endif
 }
 
 void append_timing_log_line(const char* event_name, std::string_view details) {
+#if defined(MHWILDS_DISABLE_LOGGING) && MHWILDS_DISABLE_LOGGING
+    (void)event_name;
+    (void)details;
+    return;
+#else
     std::ostringstream oss;
     oss << "[timing] t_ms=" << process_uptime_ms()
         << " event=" << (event_name != nullptr ? event_name : "<null>");
@@ -281,6 +304,7 @@ void append_timing_log_line(const char* event_name, std::string_view details) {
     }
     oss << '\n';
     append_log_line(oss.str());
+#endif
 }
 
 } // namespace mhwilds::probe

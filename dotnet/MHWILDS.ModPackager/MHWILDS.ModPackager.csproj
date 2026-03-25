@@ -6,6 +6,7 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <LangVersion>latest</LangVersion>
+    <NativePackerPath>$(MSBuildProjectDirectory)\..\..\build\Release\mhwilds_pak_packer.exe</NativePackerPath>
   </PropertyGroup>
 
   <ItemGroup>
@@ -19,4 +20,18 @@
       <DependentUpon>MainForm.cs</DependentUpon>
     </EmbeddedResource>
   </ItemGroup>
+
+  <ItemGroup Condition="Exists('$(NativePackerPath)')">
+    <Content Include="$(NativePackerPath)">
+      <Link>mhwilds_pak_packer.exe</Link>
+      <TargetPath>mhwilds_pak_packer.exe</TargetPath>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
+  </ItemGroup>
+
+  <Target Name="EnsureNativePackerPresentForPublish" BeforeTargets="Publish">
+    <Error Condition="!Exists('$(NativePackerPath)')"
+           Text="Missing native packer at $(NativePackerPath). Build the C++ Release target first so publish output includes mhwilds_pak_packer.exe." />
+  </Target>
 </Project>
