@@ -348,6 +348,23 @@ std::optional<DerivedKeyMaterial> derive_v2_key_material(const std::filesystem::
     return derive_v2_key_material(*game_fingerprint, purpose);
 }
 
+std::optional<std::array<uint8_t, 32>> compute_chunk_auth_tag(
+    uint64_t chunk_index,
+    const uint8_t* plain_bytes,
+    size_t plain_size,
+    const std::array<uint8_t, 32>& key) {
+    std::vector<uint8_t> auth_input(sizeof(chunk_index) + plain_size, 0);
+    for (size_t index = 0; index < sizeof(chunk_index); ++index) {
+        auth_input[index] = static_cast<uint8_t>((chunk_index >> (index * 8)) & 0xFF);
+    }
+
+    if (plain_bytes != nullptr && plain_size > 0) {
+        std::memcpy(auth_input.data() + sizeof(chunk_index), plain_bytes, plain_size);
+    }
+
+    return compute_hmac_sha256_bytes(auth_input.data(), auth_input.size(), key);
+}
+
 std::optional<std::vector<uint8_t>> encrypt_v2_payload_bytes(
     const std::vector<uint8_t>& plain_bytes,
     const std::array<uint8_t, 16>& game_fingerprint,
@@ -473,13 +490,13 @@ bool encrypt_pak_to_v2_container(
     std::memcpy(header.magic, encrypted_pak::kMagic.data(), encrypted_pak::kMagic.size());
     header.version = encrypted_pak::kVersion;
     header.header_size = static_cast<uint32_t>(sizeof(encrypted_pak::HeaderV2) + metadata_block.size());
-    header.algorithm = encrypted_pak::kAlgorithmAes256CbcHmacSha256;
+    header.algorithm = encrypted_pak::kAlgorithmAes256CbcChunkedHmacSha256;
     header.purpose = encrypted_pak::kPurposePak;
     std::memcpy(header.game_fingerprint, key_material.game_fingerprint.data(), key_material.game_fingerprint.size());
-
-    if (BCryptGenRandom(nullptr, header.iv, sizeof(header.iv), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
-        return false;
-    }
+    encrypted_pak::PakChunkedConfigV1 chunked_config{};
+    chunked_config.chunk_plain_size = encrypted_pak::kDefaultPakChunkPlainSize;
+    chunked_config.chunk_header_size = sizeof(encrypted_pak::PakChunkedHeaderV1);
+    std::memcpy(header.reserved, &chunked_config, sizeof(chunked_config));
 
     output.write(reinterpret_cast<const char*>(&header), sizeof(header));
     if (!output.good()) {
@@ -503,12 +520,10 @@ bool encrypt_pak_to_v2_container(
     DWORD hmac_hash_size{};
     std::vector<uint8_t> aes_key_object{};
     std::vector<uint8_t> hmac_hash_object{};
-    std::vector<uint8_t> read_buffer(encrypted_pak::kDefaultIoChunkSize, 0);
-    std::vector<uint8_t> pending{};
-    std::vector<uint8_t> cipher_buffer(encrypted_pak::kDefaultIoChunkSize + 32, 0);
-    std::array<uint8_t, 16> iv{};
+    std::vector<uint8_t> read_buffer(chunked_config.chunk_plain_size, 0);
     uint64_t plain_size = 0;
     uint64_t cipher_size = 0;
+    uint64_t chunk_index = 0;
 
     if (BCryptOpenAlgorithmProvider(&aes_algorithm.handle, BCRYPT_AES_ALGORITHM, nullptr, 0) != 0) {
         return false;
@@ -554,83 +569,90 @@ bool encrypt_pak_to_v2_container(
         return false;
     }
 
-    std::memcpy(iv.data(), header.iv, sizeof(iv));
-    pending.reserve(read_buffer.size() + sizeof(iv));
-
     while (true) {
         input.read(reinterpret_cast<char*>(read_buffer.data()), static_cast<std::streamsize>(read_buffer.size()));
-        const auto bytes_read = input.gcount();
-        if (bytes_read < 0) {
-            return false;
-        }
-
-        if (bytes_read > 0) {
-            pending.insert(pending.end(), read_buffer.begin(), read_buffer.begin() + bytes_read);
-        }
-
-        const auto is_final = input.eof();
-        size_t plain_to_process = 0;
-        if (is_final) {
-            plain_to_process = pending.size();
-        } else {
-            plain_to_process = pending.size() - (pending.size() % sizeof(iv));
-        }
-
-        if (plain_to_process == 0 && !is_final) {
-            if (!input.good()) {
+        const auto bytes_read = static_cast<size_t>(input.gcount());
+        if (bytes_read == 0) {
+            if (input.bad()) {
                 return false;
             }
-            continue;
+            break;
         }
 
-        if (cipher_buffer.size() < plain_to_process + sizeof(iv) + 16) {
-            cipher_buffer.resize(plain_to_process + sizeof(iv) + 16);
-        }
-
-        if (plain_to_process > 0 &&
-            BCryptHashData(hmac_hash.handle, pending.data(), static_cast<ULONG>(plain_to_process), 0) != 0) {
+        if (!input.good() && !input.eof()) {
             return false;
         }
 
+        std::array<uint8_t, 16> chunk_iv{};
+        if (BCryptGenRandom(nullptr, chunk_iv.data(), static_cast<ULONG>(chunk_iv.size()), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+            return false;
+        }
+
+        std::vector<uint8_t> cipher_buffer(
+            static_cast<size_t>(encrypted_pak::padded_cipher_size_for_plain_size(bytes_read)),
+            0);
+        auto iv_copy = chunk_iv;
         ULONG cipher_chunk_size{};
         const auto encrypt_status = BCryptEncrypt(
             aes_key.handle,
-            pending.data(),
-            static_cast<ULONG>(plain_to_process),
+            read_buffer.data(),
+            static_cast<ULONG>(bytes_read),
             nullptr,
-            iv.data(),
-            static_cast<ULONG>(iv.size()),
+            iv_copy.data(),
+            static_cast<ULONG>(iv_copy.size()),
             cipher_buffer.data(),
             static_cast<ULONG>(cipher_buffer.size()),
             &cipher_chunk_size,
-            is_final ? BCRYPT_BLOCK_PADDING : 0);
-
+            BCRYPT_BLOCK_PADDING);
         if (encrypt_status != 0) {
             return false;
         }
 
-        if (cipher_chunk_size > 0) {
-            output.write(reinterpret_cast<const char*>(cipher_buffer.data()), cipher_chunk_size);
+        cipher_buffer.resize(cipher_chunk_size);
+        const auto chunk_auth_tag = compute_chunk_auth_tag(
+            chunk_index,
+            read_buffer.data(),
+            bytes_read,
+            key_material.authentication_key);
+        if (!chunk_auth_tag.has_value()) {
+            return false;
+        }
+
+        encrypted_pak::PakChunkedHeaderV1 chunk_header{};
+        std::memcpy(chunk_header.iv, chunk_iv.data(), chunk_iv.size());
+        std::memcpy(chunk_header.auth_tag, chunk_auth_tag->data(), chunk_auth_tag->size());
+        chunk_header.plain_size = static_cast<uint32_t>(bytes_read);
+        chunk_header.cipher_size = static_cast<uint32_t>(cipher_buffer.size());
+
+        output.write(reinterpret_cast<const char*>(&chunk_header), sizeof(chunk_header));
+        if (!output.good()) {
+            return false;
+        }
+
+        if (!cipher_buffer.empty()) {
+            output.write(reinterpret_cast<const char*>(cipher_buffer.data()), static_cast<std::streamsize>(cipher_buffer.size()));
             if (!output.good()) {
                 return false;
             }
         }
 
-        plain_size += plain_to_process;
-        cipher_size += cipher_chunk_size;
-        pending.erase(pending.begin(), pending.begin() + static_cast<std::ptrdiff_t>(plain_to_process));
-
-        if (is_final) {
-            break;
-        }
-
-        if (!input.good()) {
+        if (BCryptHashData(
+                hmac_hash.handle,
+                reinterpret_cast<PUCHAR>(&chunk_header),
+                static_cast<ULONG>(sizeof(chunk_header)),
+                0) != 0 ||
+            (!cipher_buffer.empty() &&
+                BCryptHashData(
+                    hmac_hash.handle,
+                    cipher_buffer.data(),
+                    static_cast<ULONG>(cipher_buffer.size()),
+                    0) != 0)) {
             return false;
         }
-    }
 
-    if (!pending.empty()) {
-        return false;
+        plain_size += bytes_read;
+        cipher_size += sizeof(chunk_header) + cipher_buffer.size();
+        ++chunk_index;
     }
 
     if (BCryptFinishHash(hmac_hash.handle, header.auth_tag, sizeof(header.auth_tag), 0) != 0) {

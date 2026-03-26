@@ -6,6 +6,8 @@ REFrameworkPluginFunctions g_ref{};
 
 CreateFileWFn g_original_create_file_w{};
 ReadFileFn g_original_read_file{};
+ReadFileExFn g_original_read_file_ex{};
+GetOverlappedResultFn g_original_get_overlapped_result{};
 SetFilePointerExFn g_original_set_file_pointer_ex{};
 GetFileSizeExFn g_original_get_file_size_ex{};
 GetFileTypeFn g_original_get_file_type{};
@@ -14,13 +16,19 @@ GetFileInformationByHandleExFn g_original_get_file_information_by_handle_ex{};
 CreateFileMappingWFn g_original_create_file_mapping_w{};
 MapViewOfFileFn g_original_map_view_of_file{};
 CloseHandleFn g_original_close_handle{};
+DuplicateHandleFn g_original_duplicate_handle{};
+ReOpenFileFn g_original_re_open_file{};
+GetFinalPathNameByHandleWFn g_original_get_final_path_name_by_handle_w{};
 NtQueryInformationFileFn g_original_nt_query_information_file{};
+NtReadFileFn g_original_nt_read_file{};
 DirectStorageOpenFn g_original_directstorage_open{};
 
 std::mutex g_log_mutex{};
 std::ofstream g_log{};
 std::mutex g_trace_log_mutex{};
 std::ofstream g_trace_log{};
+std::mutex g_read_bytes_log_mutex{};
+std::ofstream g_read_bytes_log{};
 std::mutex g_stage_session_mutex{};
 std::mutex g_encrypted_mod_stage_mutex{};
 std::mutex g_update_prompt_mutex{};
@@ -38,6 +46,8 @@ std::atomic<bool> g_update_check_thread_started{false};
 std::atomic<bool> g_update_prompt_thread_running{false};
 std::atomic<uint64_t> g_create_file_pak_hits{0};
 std::atomic<uint64_t> g_read_file_hits{0};
+std::atomic<uint64_t> g_read_file_ex_hits{0};
+std::atomic<uint64_t> g_get_overlapped_result_hits{0};
 std::atomic<uint64_t> g_set_file_pointer_hits{0};
 std::atomic<uint64_t> g_get_file_size_hits{0};
 std::atomic<uint64_t> g_get_file_type_hits{0};
@@ -46,7 +56,11 @@ std::atomic<uint64_t> g_get_file_info_ex_hits{0};
 std::atomic<uint64_t> g_create_file_mapping_hits{0};
 std::atomic<uint64_t> g_map_view_of_file_hits{0};
 std::atomic<uint64_t> g_close_handle_hits{0};
+std::atomic<uint64_t> g_duplicate_handle_hits{0};
+std::atomic<uint64_t> g_re_open_file_hits{0};
+std::atomic<uint64_t> g_get_final_path_name_hits{0};
 std::atomic<uint64_t> g_nt_query_info_hits{0};
+std::atomic<uint64_t> g_nt_read_file_hits{0};
 std::atomic<uint64_t> g_directstorage_hits{0};
 std::atomic<uint64_t> g_redirect_createfile_breakpoint_hits{0};
 std::atomic<bool> g_same_point_hooks_installed{false};
@@ -57,6 +71,8 @@ std::atomic<bool> g_startup_gate_wait_logged{false};
 uintptr_t g_game_module_base{};
 void* g_create_file_target{};
 void* g_read_file_target{};
+void* g_read_file_ex_target{};
+void* g_get_overlapped_result_target{};
 void* g_set_file_pointer_ex_target{};
 void* g_get_file_size_ex_target{};
 void* g_get_file_type_target{};
@@ -65,7 +81,11 @@ void* g_get_file_information_by_handle_ex_target{};
 void* g_create_file_mapping_w_target{};
 void* g_map_view_of_file_target{};
 void* g_close_handle_target{};
+void* g_duplicate_handle_target{};
+void* g_re_open_file_target{};
+void* g_get_final_path_name_by_handle_w_target{};
 void* g_nt_query_information_file_target{};
+void* g_nt_read_file_target{};
 void* g_directstorage_target{};
 uintptr_t g_directstorage_global_ptr_addr{};
 
@@ -79,6 +99,7 @@ SafetyHookMid g_same_point_patch_version_hook{};
 std::unordered_map<uintptr_t, std::wstring> g_pak_handle_paths{};
 std::unordered_map<uintptr_t, uint64_t> g_pak_handle_positions{};
 std::unordered_map<uintptr_t, uint64_t> g_pak_handle_sizes{};
+std::unordered_map<uintptr_t, uint32_t> g_pak_read_dump_counts{};
 std::unordered_map<uintptr_t, std::wstring> g_mapping_handle_paths{};
 std::unordered_map<uintptr_t, VirtualPakHandleState> g_virtual_pak_handles{};
 std::unordered_map<uintptr_t, VirtualMappingHandleState> g_virtual_mapping_handles{};
@@ -204,6 +225,10 @@ std::filesystem::path trace_log_path() {
     return std::filesystem::current_path() / kTraceLogRelativePath;
 }
 
+std::filesystem::path read_bytes_log_path() {
+    return std::filesystem::current_path() / kReadBytesLogRelativePath;
+}
+
 std::filesystem::path loader_config_path() {
     return std::filesystem::current_path() / kLoaderConfigRelativePath;
 }
@@ -226,7 +251,6 @@ void open_log_if_needed() {
     std::filesystem::create_directories(path.parent_path());
     ScopedInternalBackendOpen internal_open_guard{};
     g_log.open(path, std::ios::out | std::ios::trunc);
-
     if (!g_log.is_open()) {
         return;
     }
@@ -287,6 +311,52 @@ void append_trace_log_line(const std::string& line) {
 
     g_trace_log << line;
     g_trace_log.flush();
+#endif
+}
+
+void append_read_bytes_log_line(const std::string& line) {
+#if defined(MHWILDS_DISABLE_LOGGING) && MHWILDS_DISABLE_LOGGING
+    (void)line;
+    return;
+#else
+    std::scoped_lock _{g_read_bytes_log_mutex};
+    if (!g_read_bytes_log.is_open()) {
+        return;
+    }
+
+    g_read_bytes_log << line;
+    g_read_bytes_log.flush();
+#endif
+}
+
+void append_read_bytes_log_bytes(const void* buffer, size_t count) {
+#if defined(MHWILDS_DISABLE_LOGGING) && MHWILDS_DISABLE_LOGGING
+    (void)buffer;
+    (void)count;
+    return;
+#else
+    if (buffer == nullptr || count == 0) {
+        return;
+    }
+
+    std::scoped_lock _{g_read_bytes_log_mutex};
+    if (!g_read_bytes_log.is_open()) {
+        return;
+    }
+
+    const auto* bytes = static_cast<const uint8_t*>(buffer);
+    constexpr size_t kBytesPerLine = 32;
+    for (size_t offset = 0; offset < count; offset += kBytesPerLine) {
+        g_read_bytes_log << std::hex << std::setw(4) << std::setfill('0') << offset << ":";
+        const auto line_end = std::min(count, offset + kBytesPerLine);
+        for (size_t i = offset; i < line_end; ++i) {
+            g_read_bytes_log << ' ' << std::setw(2) << static_cast<unsigned int>(bytes[i]);
+        }
+        g_read_bytes_log << '\n';
+    }
+
+    g_read_bytes_log << '\n';
+    g_read_bytes_log.flush();
 #endif
 }
 

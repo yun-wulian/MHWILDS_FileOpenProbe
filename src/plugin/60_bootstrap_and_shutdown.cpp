@@ -22,6 +22,7 @@ void log_install_result(const char* source, bool create_file_ok, bool directstor
         << " backend_only=" << static_cast<int>(config.backend_only)
         << " record_only=" << static_cast<int>(config.record_only)
         << " rf_chain_mode=" << static_cast<int>(config.rf_chain_mode)
+        << " probe_only=" << static_cast<int>(config.probe_only)
         << "\n";
     append_log_line(oss.str());
 }
@@ -64,8 +65,15 @@ void run_probe_installation(const char* source, bool directstorage_retry_loop) {
 #else
         constexpr bool same_point_ok = false;
 #endif
-        append_log_line("rf-chain-mode active; skipping legacy minhook backend\n");
-        log_install_result(source, false, same_point_ok, false, trace_ok);
+        const auto create_file_ok = install_create_file_hook();
+        const auto pak_io_ok = install_pak_io_hooks();
+        if (config.probe_only) {
+            append_log_line("rf-probe-mode active; same-point hooks plus createfile/pak-io enabled; redirect/directstorage disabled\n");
+            log_install_result(source, create_file_ok, false, pak_io_ok, trace_ok);
+            return;
+        }
+        append_log_line("rf-chain-mode active; same-point hooks plus createfile/pak-io enabled; legacy directstorage backend skipped\n");
+        log_install_result(source, create_file_ok, same_point_ok, pak_io_ok, trace_ok);
         return;
     }
 
@@ -177,16 +185,34 @@ void run_early_create_file_bootstrap() {
 #else
         constexpr bool same_point_ok = false;
 #endif
+        const auto create_file_ok = install_create_file_hook();
+        const auto pak_io_ok = install_pak_io_hooks();
+        if (config.probe_only) {
+            std::ostringstream rf_probe_oss;
+            rf_probe_oss << "early-bootstrap-result"
+                << " createfile=" << static_cast<int>(create_file_ok)
+                << " pak_io=" << static_cast<int>(pak_io_ok)
+                << " hw_trace=" << static_cast<int>(trace_ok)
+                << " patch_break=0"
+                << " same_point=" << static_cast<int>(same_point_ok)
+                << " rf_chain_mode=1"
+                << " probe_only=1"
+                << "\n";
+            append_log_line("rf-probe-mode active during early bootstrap; same-point hooks plus createfile/pak-io enabled; redirect/directstorage disabled\n");
+            append_log_line(rf_probe_oss.str());
+            return;
+        }
         std::ostringstream rf_oss;
         rf_oss << "early-bootstrap-result"
-            << " createfile=0"
-            << " pak_io=0"
+            << " createfile=" << static_cast<int>(create_file_ok)
+            << " pak_io=" << static_cast<int>(pak_io_ok)
             << " hw_trace=" << static_cast<int>(trace_ok)
             << " patch_break=0"
             << " same_point=" << static_cast<int>(same_point_ok)
             << " rf_chain_mode=1"
+            << " probe_only=0"
             << "\n";
-        append_log_line("rf-chain-mode active during early bootstrap; skipping legacy minhook backend\n");
+        append_log_line("rf-chain-mode active during early bootstrap; same-point hooks plus createfile/pak-io enabled; legacy directstorage backend skipped\n");
         append_log_line(rf_oss.str());
         return;
     }
@@ -236,6 +262,7 @@ void run_early_create_file_bootstrap() {
         << " observer_only=0"
         << " backend_only=" << static_cast<int>(config.backend_only)
         << " record_only=" << static_cast<int>(config.record_only)
+        << " probe_only=" << static_cast<int>(config.probe_only)
         << "\n";
     append_log_line(oss.str());
 }
@@ -269,9 +296,39 @@ void shutdown_hooks() {
         MH_RemoveHook(g_read_file_target);
     }
 
+    if (g_read_file_ex_target != nullptr) {
+        MH_DisableHook(g_read_file_ex_target);
+        MH_RemoveHook(g_read_file_ex_target);
+    }
+
+    if (g_get_overlapped_result_target != nullptr) {
+        MH_DisableHook(g_get_overlapped_result_target);
+        MH_RemoveHook(g_get_overlapped_result_target);
+    }
+
     if (g_set_file_pointer_ex_target != nullptr) {
         MH_DisableHook(g_set_file_pointer_ex_target);
         MH_RemoveHook(g_set_file_pointer_ex_target);
+    }
+
+    if (g_get_file_size_ex_target != nullptr) {
+        MH_DisableHook(g_get_file_size_ex_target);
+        MH_RemoveHook(g_get_file_size_ex_target);
+    }
+
+    if (g_get_file_type_target != nullptr) {
+        MH_DisableHook(g_get_file_type_target);
+        MH_RemoveHook(g_get_file_type_target);
+    }
+
+    if (g_get_file_information_by_handle_target != nullptr) {
+        MH_DisableHook(g_get_file_information_by_handle_target);
+        MH_RemoveHook(g_get_file_information_by_handle_target);
+    }
+
+    if (g_get_file_information_by_handle_ex_target != nullptr) {
+        MH_DisableHook(g_get_file_information_by_handle_ex_target);
+        MH_RemoveHook(g_get_file_information_by_handle_ex_target);
     }
 
     if (g_create_file_mapping_w_target != nullptr) {
@@ -289,6 +346,31 @@ void shutdown_hooks() {
         MH_RemoveHook(g_close_handle_target);
     }
 
+    if (g_duplicate_handle_target != nullptr) {
+        MH_DisableHook(g_duplicate_handle_target);
+        MH_RemoveHook(g_duplicate_handle_target);
+    }
+
+    if (g_re_open_file_target != nullptr) {
+        MH_DisableHook(g_re_open_file_target);
+        MH_RemoveHook(g_re_open_file_target);
+    }
+
+    if (g_get_final_path_name_by_handle_w_target != nullptr) {
+        MH_DisableHook(g_get_final_path_name_by_handle_w_target);
+        MH_RemoveHook(g_get_final_path_name_by_handle_w_target);
+    }
+
+    if (g_nt_query_information_file_target != nullptr) {
+        MH_DisableHook(g_nt_query_information_file_target);
+        MH_RemoveHook(g_nt_query_information_file_target);
+    }
+
+    if (g_nt_read_file_target != nullptr) {
+        MH_DisableHook(g_nt_read_file_target);
+        MH_RemoveHook(g_nt_read_file_target);
+    }
+
     if (g_directstorage_target != nullptr) {
         MH_DisableHook(g_directstorage_target);
         MH_RemoveHook(g_directstorage_target);
@@ -302,6 +384,7 @@ void shutdown_hooks() {
     g_pak_handle_paths.clear();
     g_pak_handle_positions.clear();
     g_pak_handle_sizes.clear();
+    g_pak_read_dump_counts.clear();
     g_mapping_handle_paths.clear();
     g_virtual_pak_handles.clear();
     g_virtual_mapping_handles.clear();

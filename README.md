@@ -171,6 +171,7 @@ Important fields:
 - `mode`
 - `source_path`
 - `custom_pak_dir`
+- `stage_source`
 - `trace_enabled`
 - `trace_start_rva`
 - `trace_max_instructions`

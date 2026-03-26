@@ -220,6 +220,8 @@ VirtualPakLoaderConfig load_virtual_loader_config_from_disk() {
             config.backend_only = parse_bool_value(value);
         } else if (_stricmp(key.c_str(), "record_only") == 0) {
             config.record_only = parse_bool_value(value);
+        } else if (_stricmp(key.c_str(), "probe_only") == 0) {
+            config.probe_only = parse_bool_value(value);
         } else if (_stricmp(key.c_str(), "plain_source") == 0) {
             config.plain_source = parse_bool_value(value);
         } else if (_stricmp(key.c_str(), "stage_source") == 0) {
@@ -240,7 +242,15 @@ VirtualPakLoaderConfig load_virtual_loader_config_from_disk() {
             config.observer_only = _stricmp(value.c_str(), "observer") == 0 || _stricmp(value.c_str(), "observe") == 0 || _stricmp(value.c_str(), "logonly") == 0;
             config.backend_only = _stricmp(value.c_str(), "backend") == 0 || _stricmp(value.c_str(), "backend_only") == 0 || _stricmp(value.c_str(), "minimal") == 0;
             config.record_only = _stricmp(value.c_str(), "record") == 0 || _stricmp(value.c_str(), "record_only") == 0 || _stricmp(value.c_str(), "trace") == 0 || _stricmp(value.c_str(), "monitor") == 0;
-            config.rf_chain_mode = _stricmp(value.c_str(), "rf_chain") == 0 || _stricmp(value.c_str(), "reframework_chain") == 0 || _stricmp(value.c_str(), "extend") == 0;
+            config.probe_only = _stricmp(value.c_str(), "probe") == 0 ||
+                                _stricmp(value.c_str(), "rf_probe") == 0 ||
+                                _stricmp(value.c_str(), "rf_chain_probe") == 0 ||
+                                _stricmp(value.c_str(), "reframework_probe") == 0 ||
+                                _stricmp(value.c_str(), "reframework_chain_probe") == 0;
+            config.rf_chain_mode = config.probe_only ||
+                                   _stricmp(value.c_str(), "rf_chain") == 0 ||
+                                   _stricmp(value.c_str(), "reframework_chain") == 0 ||
+                                   _stricmp(value.c_str(), "extend") == 0;
             config.plain_source = _stricmp(value.c_str(), "backend_plaintext") == 0 || _stricmp(value.c_str(), "backend_raw") == 0;
             config.passthrough = _stricmp(value.c_str(), "passthrough") == 0 || _stricmp(value.c_str(), "real") == 0;
             config.stage_source =
@@ -273,6 +283,9 @@ VirtualPakLoaderConfig load_virtual_loader_config_from_disk() {
     if (config.stage_source) {
         config.passthrough = true;
     }
+    if (config.probe_only) {
+        config.rf_chain_mode = true;
+    }
 
     ensure_stage_startup_cleanup(config);
     config.target_path_normalized = normalize_path_for_match(config.target_path);
@@ -292,7 +305,7 @@ VirtualPakLoaderConfig load_virtual_loader_config_from_disk() {
     recompute_virtual_loader_patch_counts(config);
 
     const auto exact_target_mode = !config.target_path_normalized.empty();
-    if (config.record_only) {
+    if (config.record_only || config.probe_only) {
         if (!exact_target_mode) {
             config.enabled = false;
         }
@@ -325,6 +338,7 @@ void reload_virtual_loader_config() {
         << " backend_only=" << static_cast<int>(config.backend_only)
         << " record_only=" << static_cast<int>(config.record_only)
         << " rf_chain_mode=" << static_cast<int>(config.rf_chain_mode)
+        << " probe_only=" << static_cast<int>(config.probe_only)
         << " plain_source=" << static_cast<int>(config.plain_source)
         << " stage_source=" << static_cast<int>(config.stage_source)
         << " keep_staged_file=" << static_cast<int>(config.keep_staged_file)
@@ -764,6 +778,32 @@ std::optional<DerivedKeyMaterial> derive_v2_key_material(uint32_t purpose) {
     return material;
 }
 
+std::optional<std::array<uint8_t, 32>> compute_chunk_auth_tag(
+    uint64_t chunk_index,
+    const uint8_t* plain_bytes,
+    size_t plain_size,
+    const std::array<uint8_t, 32>& key) {
+    std::vector<uint8_t> auth_input(sizeof(chunk_index) + plain_size, 0);
+    for (size_t index = 0; index < sizeof(chunk_index); ++index) {
+        auth_input[index] = static_cast<uint8_t>((chunk_index >> (index * 8)) & 0xFF);
+    }
+
+    if (plain_bytes != nullptr && plain_size > 0) {
+        std::memcpy(auth_input.data() + sizeof(chunk_index), plain_bytes, plain_size);
+    }
+
+    return compute_hmac_sha256_bytes(auth_input.data(), auth_input.size(), key);
+}
+
+bool parse_chunked_config(
+    const encrypted_pak::HeaderV2& header,
+    encrypted_pak::PakChunkedConfigV1& chunked_config) {
+    std::memcpy(&chunked_config, header.reserved, sizeof(chunked_config));
+    return chunked_config.chunk_plain_size != 0 &&
+        (chunked_config.chunk_plain_size % encrypted_pak::kAesBlockSize) == 0 &&
+        chunked_config.chunk_header_size == sizeof(encrypted_pak::PakChunkedHeaderV1);
+}
+
 std::filesystem::path stage_index_path(const VirtualPakLoaderConfig& config) {
     return resolve_stage_root(config) / kStageIndexFileName;
 }
@@ -1103,6 +1143,106 @@ std::optional<std::vector<uint8_t>> decrypt_xor32(
     return output;
 }
 
+std::optional<std::vector<uint8_t>> decode_v2_chunked_pak_bytes(
+    const std::vector<uint8_t>& file_bytes,
+    const encrypted_pak::HeaderV2& header,
+    const DerivedKeyMaterial& material) {
+    encrypted_pak::PakChunkedConfigV1 chunked_config{};
+    if (!parse_chunked_config(header, chunked_config)) {
+        append_log_line("virtual-loader-header-size-invalid\n");
+        return std::nullopt;
+    }
+
+    const auto payload_offset = static_cast<size_t>(header.header_size);
+    const auto expected_payload_size = encrypted_pak::total_chunked_payload_size(header.plain_size, chunked_config.chunk_plain_size);
+    if (header.cipher_size != expected_payload_size ||
+        payload_offset > file_bytes.size() ||
+        header.cipher_size > file_bytes.size() - payload_offset) {
+        append_log_line("virtual-loader-header-size-invalid\n");
+        return std::nullopt;
+    }
+
+    const auto container_auth = compute_hmac_sha256_bytes(
+        file_bytes.data() + payload_offset,
+        static_cast<size_t>(header.cipher_size),
+        material.authentication_key);
+    if (!container_auth.has_value() ||
+        std::memcmp(container_auth->data(), header.auth_tag, container_auth->size()) != 0) {
+        append_log_line("virtual-loader-auth-failed\n");
+        return std::nullopt;
+    }
+
+    std::vector<uint8_t> output{};
+    output.reserve(static_cast<size_t>(header.plain_size));
+
+    const auto chunk_count = encrypted_pak::chunk_count_for_plain_size(header.plain_size, chunked_config.chunk_plain_size);
+    for (uint64_t chunk_index = 0; chunk_index < chunk_count; ++chunk_index) {
+        const auto chunk_offset = payload_offset + static_cast<size_t>(
+            encrypted_pak::chunk_record_offset_from_payload_base(
+                header.plain_size,
+                chunked_config.chunk_plain_size,
+                chunk_index));
+        if (chunk_offset + sizeof(encrypted_pak::PakChunkedHeaderV1) > file_bytes.size()) {
+            append_log_line("virtual-loader-header-size-invalid\n");
+            return std::nullopt;
+        }
+
+        encrypted_pak::PakChunkedHeaderV1 chunk_header{};
+        std::memcpy(&chunk_header, file_bytes.data() + chunk_offset, sizeof(chunk_header));
+        const auto expected_plain_size = encrypted_pak::plain_size_for_chunk_index(
+            header.plain_size,
+            chunked_config.chunk_plain_size,
+            chunk_index);
+        const auto expected_cipher_size = encrypted_pak::padded_cipher_size_for_plain_size(expected_plain_size);
+        if (chunk_header.plain_size != expected_plain_size ||
+            chunk_header.cipher_size != expected_cipher_size ||
+            chunk_offset + sizeof(chunk_header) + chunk_header.cipher_size > file_bytes.size()) {
+            append_log_line("virtual-loader-header-size-invalid\n");
+            return std::nullopt;
+        }
+
+        std::vector<uint8_t> cipher_text(static_cast<size_t>(chunk_header.cipher_size), 0);
+        if (!cipher_text.empty()) {
+            std::memcpy(
+                cipher_text.data(),
+                file_bytes.data() + chunk_offset + sizeof(chunk_header),
+                cipher_text.size());
+        }
+
+        std::array<uint8_t, 16> chunk_iv{};
+        std::memcpy(chunk_iv.data(), chunk_header.iv, chunk_iv.size());
+        const auto plain_bytes = decrypt_aes256_cbc(
+            cipher_text,
+            material.encryption_key,
+            chunk_iv,
+            chunk_header.plain_size);
+        if (!plain_bytes.has_value()) {
+            append_log_line("virtual-loader-decrypt-failed\n");
+            return std::nullopt;
+        }
+
+        const auto chunk_auth = compute_chunk_auth_tag(
+            chunk_index,
+            plain_bytes->data(),
+            plain_bytes->size(),
+            material.authentication_key);
+        if (!chunk_auth.has_value() ||
+            std::memcmp(chunk_auth->data(), chunk_header.auth_tag, chunk_auth->size()) != 0) {
+            append_log_line("virtual-loader-auth-failed\n");
+            return std::nullopt;
+        }
+
+        output.insert(output.end(), plain_bytes->begin(), plain_bytes->end());
+    }
+
+    if (output.size() != header.plain_size) {
+        append_log_line("virtual-loader-header-size-invalid\n");
+        return std::nullopt;
+    }
+
+    return output;
+}
+
 std::optional<std::vector<uint8_t>> decode_v2_encrypted_pak_bytes(
     const std::vector<uint8_t>& file_bytes,
     uint32_t expected_purpose) {
@@ -1120,8 +1260,7 @@ std::optional<std::vector<uint8_t>> decode_v2_encrypted_pak_bytes(
     }
 
     if (header.header_size < sizeof(encrypted_pak::HeaderV2) ||
-        header.header_size > file_bytes.size() ||
-        header.algorithm != encrypted_pak::kAlgorithmAes256CbcHmacSha256) {
+        header.header_size > file_bytes.size()) {
         append_log_line("virtual-loader-header-size-invalid\n");
         return std::nullopt;
     }
@@ -1132,15 +1271,6 @@ std::optional<std::vector<uint8_t>> decode_v2_encrypted_pak_bytes(
             << " actual=" << header.purpose
             << "\n";
         append_log_line(oss.str());
-        return std::nullopt;
-    }
-
-    const auto payload_offset = static_cast<size_t>(header.header_size);
-    if (header.cipher_size == 0 ||
-        (header.cipher_size % 16) != 0 ||
-        header.cipher_size > file_bytes.size() ||
-        payload_offset + header.cipher_size > file_bytes.size()) {
-        append_log_line("virtual-loader-header-size-invalid\n");
         return std::nullopt;
     }
 
@@ -1155,6 +1285,29 @@ std::optional<std::vector<uint8_t>> decode_v2_encrypted_pak_bytes(
             << " actual=" << hex_encode_bytes(header.game_fingerprint, material->game_fingerprint.size())
             << "\n";
         append_log_line(oss.str());
+        return std::nullopt;
+    }
+
+    if (header.algorithm == encrypted_pak::kAlgorithmAes256CbcChunkedHmacSha256) {
+        if (header.purpose != encrypted_pak::kPurposePak) {
+            append_log_line("virtual-loader-header-invalid\n");
+            return std::nullopt;
+        }
+
+        return decode_v2_chunked_pak_bytes(file_bytes, header, *material);
+    }
+
+    if (header.algorithm != encrypted_pak::kAlgorithmAes256CbcHmacSha256) {
+        append_log_line("virtual-loader-header-size-invalid\n");
+        return std::nullopt;
+    }
+
+    const auto payload_offset = static_cast<size_t>(header.header_size);
+    if (header.cipher_size == 0 ||
+        (header.cipher_size % 16) != 0 ||
+        header.cipher_size > file_bytes.size() ||
+        payload_offset + header.cipher_size > file_bytes.size()) {
+        append_log_line("virtual-loader-header-size-invalid\n");
         return std::nullopt;
     }
 
@@ -1402,6 +1555,25 @@ bool decrypt_v2_encrypted_pak_to_file(
         return false;
     }
 
+    if (header.algorithm == encrypted_pak::kAlgorithmAes256CbcChunkedHmacSha256) {
+        const auto encrypted_bytes = read_binary_file(source_path);
+        if (!encrypted_bytes.has_value()) {
+            append_log_line("mhwsmod-read-failed\n");
+            return false;
+        }
+
+        const auto plain_bytes = decode_v2_encrypted_pak_bytes(*encrypted_bytes, encrypted_pak::kPurposePak);
+        if (!plain_bytes.has_value() || !write_binary_file(output_path, *plain_bytes)) {
+            append_log_line("mhwsmod-stage-write-failed\n");
+            return false;
+        }
+
+        if (plain_size_out != nullptr) {
+            *plain_size_out = plain_bytes->size();
+        }
+        return true;
+    }
+
     ScopedInternalBackendOpen internal_open_guard{};
     std::ifstream input(source_path, std::ios::binary);
     if (!input) {
@@ -1621,12 +1793,12 @@ std::optional<uint64_t> stage_encrypted_container_to_file(
 
         encrypted_pak::HeaderV2 header{};
         std::memcpy(&header, header_bytes.data(), sizeof(header));
+        const auto chunked_algorithm = header.algorithm == encrypted_pak::kAlgorithmAes256CbcChunkedHmacSha256;
         if (header.version != encrypted_pak::kVersion ||
             header.header_size < sizeof(encrypted_pak::HeaderV2) ||
-            header.algorithm != encrypted_pak::kAlgorithmAes256CbcHmacSha256 ||
             header.purpose != encrypted_pak::kPurposePak ||
-            header.cipher_size == 0 ||
-            (header.cipher_size % 16) != 0) {
+            (header.algorithm != encrypted_pak::kAlgorithmAes256CbcHmacSha256 && !chunked_algorithm) ||
+            (!chunked_algorithm && (header.cipher_size == 0 || (header.cipher_size % 16) != 0))) {
             append_log_line("mhwsmod-header-invalid\n");
             return std::nullopt;
         }
@@ -1636,6 +1808,15 @@ std::optional<uint64_t> stage_encrypted_container_to_file(
         if (size_ec || header.header_size > source_size || header.cipher_size > source_size - header.header_size) {
             append_log_line("mhwsmod-header-size-invalid\n");
             return std::nullopt;
+        }
+
+        if (chunked_algorithm) {
+            encrypted_pak::PakChunkedConfigV1 chunked_config{};
+            if (!parse_chunked_config(header, chunked_config) ||
+                header.cipher_size != encrypted_pak::total_chunked_payload_size(header.plain_size, chunked_config.chunk_plain_size)) {
+                append_log_line("mhwsmod-header-size-invalid\n");
+                return std::nullopt;
+            }
         }
 
         uint64_t plain_size{};
@@ -1664,6 +1845,26 @@ std::vector<std::wstring> stage_selected_encrypted_mods_into_local_dir(
     const std::vector<std::wstring>& encrypted_source_paths) {
     std::scoped_lock _{g_encrypted_mod_stage_mutex};
     if (g_encrypted_mod_stage_prepared.exchange(true)) {
+        return g_encrypted_mod_stage_cache.staged_paths;
+    }
+
+    if (!config.stage_source) {
+        g_encrypted_mod_stage_cache.staged_dir.clear();
+        g_encrypted_mod_stage_cache.staged_paths = encrypted_source_paths;
+
+        for (const auto& source_path : encrypted_source_paths) {
+            std::ostringstream item_oss;
+            item_oss << "mhwsmod-memory-source source=" << narrow_utf8(source_path) << "\n";
+            append_log_line(item_oss.str());
+        }
+
+        std::ostringstream summary_oss;
+        summary_oss << "mhwsmod-stage-summary"
+            << " mode=memory"
+            << " source_count=" << encrypted_source_paths.size()
+            << " staged_count=" << encrypted_source_paths.size()
+            << "\n";
+        append_log_line(summary_oss.str());
         return g_encrypted_mod_stage_cache.staged_paths;
     }
 
@@ -1726,7 +1927,393 @@ std::vector<std::wstring> stage_encrypted_custom_mods_into_local_dir(const Virtu
     return stage_selected_encrypted_mods_into_local_dir(config, resolve_encrypted_custom_mod_paths());
 }
 
-std::optional<std::shared_ptr<std::vector<uint8_t>>> load_virtual_pak_payload() {
+std::optional<std::shared_ptr<VirtualPakRandomAccessView>> try_build_virtual_random_access_view(
+    const std::filesystem::path& source_path,
+    const std::wstring& source_path_text,
+    const std::filesystem::file_time_type& write_time) {
+    ScopedInternalBackendOpen internal_open_guard{};
+    std::ifstream input(source_path, std::ios::binary);
+    if (!input) {
+        return std::nullopt;
+    }
+
+    std::array<uint8_t, sizeof(encrypted_pak::HeaderV2)> header_bytes{};
+    input.read(reinterpret_cast<char*>(header_bytes.data()), static_cast<std::streamsize>(header_bytes.size()));
+    if (input.gcount() != static_cast<std::streamsize>(header_bytes.size())) {
+        return std::nullopt;
+    }
+
+    encrypted_pak::HeaderV2 header{};
+    std::memcpy(&header, header_bytes.data(), sizeof(header));
+    if (std::memcmp(header.magic, encrypted_pak::kMagic.data(), encrypted_pak::kMagic.size()) != 0 ||
+        header.version != encrypted_pak::kVersion ||
+        header.algorithm != encrypted_pak::kAlgorithmAes256CbcChunkedHmacSha256 ||
+        header.purpose != encrypted_pak::kPurposePak) {
+        return std::nullopt;
+    }
+
+    encrypted_pak::PakChunkedConfigV1 chunked_config{};
+    if (!parse_chunked_config(header, chunked_config)) {
+        append_log_line("virtual-loader-header-size-invalid\n");
+        return std::nullopt;
+    }
+
+    std::error_code size_ec{};
+    const auto source_size = std::filesystem::file_size(source_path, size_ec);
+    const auto expected_payload_size = encrypted_pak::total_chunked_payload_size(header.plain_size, chunked_config.chunk_plain_size);
+    if (size_ec ||
+        header.header_size < sizeof(encrypted_pak::HeaderV2) ||
+        header.header_size > source_size ||
+        header.cipher_size != expected_payload_size ||
+        header.cipher_size > source_size - header.header_size) {
+        append_log_line("virtual-loader-header-size-invalid\n");
+        return std::nullopt;
+    }
+
+    const auto material = derive_v2_key_material(header.purpose);
+    if (!material.has_value()) {
+        return std::nullopt;
+    }
+
+    if (std::memcmp(header.game_fingerprint, material->game_fingerprint.data(), material->game_fingerprint.size()) != 0) {
+        std::ostringstream oss;
+        oss << "virtual-loader-fingerprint-mismatch expected=" << hex_encode_bytes(material->game_fingerprint.data(), material->game_fingerprint.size())
+            << " actual=" << hex_encode_bytes(header.game_fingerprint, material->game_fingerprint.size())
+            << "\n";
+        append_log_line(oss.str());
+        return std::nullopt;
+    }
+
+    auto view = std::make_shared<VirtualPakRandomAccessView>();
+    view->source_path = source_path_text;
+    view->write_time = write_time;
+    view->header = header;
+    view->chunk_plain_size = chunked_config.chunk_plain_size;
+    view->full_chunk_cipher_size = encrypted_pak::full_chunk_cipher_size(chunked_config.chunk_plain_size);
+    view->full_chunk_record_size = encrypted_pak::full_chunk_record_size(chunked_config.chunk_plain_size);
+    view->chunk_count = encrypted_pak::chunk_count_for_plain_size(header.plain_size, chunked_config.chunk_plain_size);
+    view->encryption_key = material->encryption_key;
+    view->authentication_key = material->authentication_key;
+    return view;
+}
+
+std::shared_ptr<std::vector<uint8_t>> load_virtual_pak_chunk(
+    const std::shared_ptr<VirtualPakRandomAccessView>& view,
+    uint64_t chunk_index) {
+    if (view == nullptr || chunk_index >= view->chunk_count) {
+        return nullptr;
+    }
+
+    {
+        std::scoped_lock _{view->cache_mutex};
+        if (view->cached_chunk_index.has_value() &&
+            *view->cached_chunk_index == chunk_index &&
+            view->cached_chunk != nullptr) {
+            return view->cached_chunk;
+        }
+    }
+
+    const auto chunk_offset = static_cast<uint64_t>(view->header.header_size) +
+        encrypted_pak::chunk_record_offset_from_payload_base(
+            view->header.plain_size,
+            view->chunk_plain_size,
+            chunk_index);
+    const auto expected_plain_size = encrypted_pak::plain_size_for_chunk_index(
+        view->header.plain_size,
+        view->chunk_plain_size,
+        chunk_index);
+    const auto expected_cipher_size = encrypted_pak::padded_cipher_size_for_plain_size(expected_plain_size);
+
+    encrypted_pak::PakChunkedHeaderV1 chunk_header{};
+    std::vector<uint8_t> cipher_bytes(static_cast<size_t>(expected_cipher_size), 0);
+    {
+        ScopedInternalBackendOpen internal_open_guard{};
+        std::ifstream input(std::filesystem::path{view->source_path}, std::ios::binary);
+        if (!input) {
+            append_log_line("virtual-loader-source-read-failed\n");
+            return nullptr;
+        }
+
+        input.seekg(static_cast<std::streamoff>(chunk_offset), std::ios::beg);
+        if (!input.good()) {
+            append_log_line("virtual-loader-header-size-invalid\n");
+            return nullptr;
+        }
+
+        input.read(reinterpret_cast<char*>(&chunk_header), static_cast<std::streamsize>(sizeof(chunk_header)));
+        if (input.gcount() != static_cast<std::streamsize>(sizeof(chunk_header))) {
+            append_log_line("virtual-loader-header-size-invalid\n");
+            return nullptr;
+        }
+
+        if (chunk_header.plain_size != expected_plain_size ||
+            chunk_header.cipher_size != expected_cipher_size) {
+            append_log_line("virtual-loader-header-size-invalid\n");
+            return nullptr;
+        }
+
+        if (!cipher_bytes.empty()) {
+            input.read(reinterpret_cast<char*>(cipher_bytes.data()), static_cast<std::streamsize>(cipher_bytes.size()));
+            if (input.gcount() != static_cast<std::streamsize>(cipher_bytes.size())) {
+                append_log_line("virtual-loader-source-read-failed\n");
+                return nullptr;
+            }
+        }
+    }
+
+    std::array<uint8_t, 16> chunk_iv{};
+    std::memcpy(chunk_iv.data(), chunk_header.iv, chunk_iv.size());
+    const auto plain_bytes = decrypt_aes256_cbc(
+        cipher_bytes,
+        view->encryption_key,
+        chunk_iv,
+        chunk_header.plain_size);
+    if (!plain_bytes.has_value()) {
+        append_log_line("virtual-loader-decrypt-failed\n");
+        return nullptr;
+    }
+
+    const auto chunk_auth = compute_chunk_auth_tag(
+        chunk_index,
+        plain_bytes->data(),
+        plain_bytes->size(),
+        view->authentication_key);
+    if (!chunk_auth.has_value() ||
+        std::memcmp(chunk_auth->data(), chunk_header.auth_tag, chunk_auth->size()) != 0) {
+        append_log_line("virtual-loader-auth-failed\n");
+        return nullptr;
+    }
+
+    auto cached_chunk = std::make_shared<std::vector<uint8_t>>(*plain_bytes);
+    {
+        std::scoped_lock _{view->cache_mutex};
+        view->cached_chunk_index = chunk_index;
+        view->cached_chunk = cached_chunk;
+    }
+    return cached_chunk;
+}
+
+std::shared_ptr<std::vector<uint8_t>> ensure_virtual_payload_materialized(
+    const std::shared_ptr<VirtualPakRandomAccessView>& view) {
+    if (view == nullptr) {
+        return nullptr;
+    }
+
+    {
+        std::scoped_lock _{view->cache_mutex};
+        if (view->materialized_payload != nullptr) {
+            return view->materialized_payload;
+        }
+    }
+
+    auto payload = std::make_shared<std::vector<uint8_t>>();
+    payload->reserve(static_cast<size_t>(view->header.plain_size));
+    for (uint64_t chunk_index = 0; chunk_index < view->chunk_count; ++chunk_index) {
+        const auto chunk = load_virtual_pak_chunk(view, chunk_index);
+        if (chunk == nullptr) {
+            return nullptr;
+        }
+
+        payload->insert(payload->end(), chunk->begin(), chunk->end());
+    }
+
+    {
+        std::scoped_lock _{view->cache_mutex};
+        if (view->materialized_payload == nullptr) {
+            view->materialized_payload = payload;
+        }
+        return view->materialized_payload;
+    }
+}
+
+std::optional<size_t> read_virtual_pak_view_bytes(
+    const std::shared_ptr<VirtualPakRandomAccessView>& view,
+    uint64_t read_offset,
+    void* buffer,
+    size_t bytes_to_read) {
+    if (view == nullptr) {
+        return std::nullopt;
+    }
+
+    if (bytes_to_read == 0 || read_offset >= view->header.plain_size) {
+        return static_cast<size_t>(0);
+    }
+
+    const auto available_bytes = static_cast<size_t>(std::min<uint64_t>(
+        bytes_to_read,
+        view->header.plain_size - read_offset));
+    const auto first_chunk_remaining = static_cast<size_t>(view->chunk_plain_size - (read_offset % view->chunk_plain_size));
+    if (available_bytes > first_chunk_remaining) {
+        const auto payload = ensure_virtual_payload_materialized(view);
+        if (payload == nullptr || read_offset >= payload->size()) {
+            return std::nullopt;
+        }
+
+        const auto remaining = payload->size() - static_cast<size_t>(read_offset);
+        const auto transferred = std::min(remaining, available_bytes);
+        if (transferred != 0 && buffer != nullptr) {
+            std::memcpy(buffer, payload->data() + read_offset, transferred);
+        }
+        return transferred;
+    }
+
+    {
+        std::scoped_lock _{view->cache_mutex};
+        if (view->materialized_payload != nullptr) {
+            const auto remaining = view->materialized_payload->size() - static_cast<size_t>(read_offset);
+            const auto transferred = std::min(remaining, bytes_to_read);
+            if (transferred != 0 && buffer != nullptr) {
+                std::memcpy(buffer, view->materialized_payload->data() + read_offset, transferred);
+            }
+            return transferred;
+        }
+    }
+
+    auto destination = static_cast<uint8_t*>(buffer);
+    auto transferred = static_cast<size_t>(0);
+    auto remaining = std::min<uint64_t>(bytes_to_read, view->header.plain_size - read_offset);
+    auto current_offset = read_offset;
+
+    while (remaining > 0) {
+        const auto chunk_index = current_offset / view->chunk_plain_size;
+        const auto chunk_inner_offset = static_cast<size_t>(current_offset % view->chunk_plain_size);
+        const auto chunk = load_virtual_pak_chunk(view, chunk_index);
+        if (chunk == nullptr || chunk_inner_offset > chunk->size()) {
+            return std::nullopt;
+        }
+
+        const auto chunk_available = chunk->size() - chunk_inner_offset;
+        const auto copy_size = static_cast<size_t>(std::min<uint64_t>(remaining, chunk_available));
+        if (copy_size == 0) {
+            return std::nullopt;
+        }
+
+        if (destination != nullptr) {
+            std::memcpy(destination + transferred, chunk->data() + chunk_inner_offset, copy_size);
+        }
+
+        transferred += copy_size;
+        current_offset += copy_size;
+        remaining -= copy_size;
+    }
+
+    return transferred;
+}
+
+std::optional<PreparedVirtualPakSource> load_virtual_pak_payload_for_source(
+    const std::wstring& source_path_text,
+    bool plain_source) {
+    if (source_path_text.empty()) {
+        return std::nullopt;
+    }
+
+    const std::filesystem::path source_path{source_path_text};
+    std::error_code ec{};
+    const auto write_time = std::filesystem::last_write_time(source_path, ec);
+    if (ec) {
+        std::ostringstream oss;
+        oss << "virtual-loader-source-missing path=" << narrow_utf8(source_path_text)
+            << " ec=" << ec.value()
+            << "\n";
+        append_log_line(oss.str());
+        return std::nullopt;
+    }
+
+    {
+        std::scoped_lock _{g_virtual_loader_mutex};
+        if (g_virtual_payload_cache.source_path == source_path_text &&
+            g_virtual_payload_cache.write_time == write_time &&
+            (g_virtual_payload_cache.payload != nullptr || g_virtual_payload_cache.random_access_view != nullptr)) {
+            PreparedVirtualPakSource cached{};
+            cached.payload = g_virtual_payload_cache.payload;
+            cached.random_access_view = g_virtual_payload_cache.random_access_view;
+            return cached;
+        }
+    }
+
+    if (plain_source) {
+        const auto file_bytes = read_binary_file(source_path);
+        if (!file_bytes.has_value()) {
+            append_log_line("virtual-loader-source-read-failed\n");
+            return std::nullopt;
+        }
+
+        PreparedVirtualPakSource prepared{};
+        prepared.payload = std::make_shared<std::vector<uint8_t>>(*file_bytes);
+
+        {
+            std::scoped_lock _{g_virtual_loader_mutex};
+            g_virtual_payload_cache.source_path = source_path_text;
+            g_virtual_payload_cache.write_time = write_time;
+            g_virtual_payload_cache.payload = prepared.payload;
+            g_virtual_payload_cache.random_access_view = nullptr;
+        }
+
+        std::ostringstream oss;
+        oss << "virtual-loader-plain-payload-ready source=" << narrow_utf8(source_path_text)
+            << " size=0x" << std::hex << prepared.payload->size()
+            << "\n";
+        append_log_line(oss.str());
+
+        return prepared;
+    }
+
+    if (const auto random_access_view = try_build_virtual_random_access_view(source_path, source_path_text, write_time);
+        random_access_view.has_value()) {
+        PreparedVirtualPakSource prepared{};
+        prepared.random_access_view = *random_access_view;
+
+        {
+            std::scoped_lock _{g_virtual_loader_mutex};
+            g_virtual_payload_cache.source_path = source_path_text;
+            g_virtual_payload_cache.write_time = write_time;
+            g_virtual_payload_cache.payload = nullptr;
+            g_virtual_payload_cache.random_access_view = prepared.random_access_view;
+        }
+
+        std::ostringstream oss;
+        oss << "virtual-loader-random-access-ready source=" << narrow_utf8(source_path_text)
+            << " plain_size=0x" << std::hex << prepared.random_access_view->header.plain_size
+            << " chunk_size=0x" << prepared.random_access_view->chunk_plain_size
+            << " chunk_count=0x" << prepared.random_access_view->chunk_count
+            << "\n";
+        append_log_line(oss.str());
+
+        return prepared;
+    }
+
+    const auto file_bytes = read_binary_file(source_path);
+    if (!file_bytes.has_value()) {
+        append_log_line("virtual-loader-source-read-failed\n");
+        return std::nullopt;
+    }
+
+    const auto plain_bytes = decode_encrypted_pak_bytes(*file_bytes);
+    if (!plain_bytes.has_value()) {
+        return std::nullopt;
+    }
+
+    PreparedVirtualPakSource prepared{};
+    prepared.payload = std::make_shared<std::vector<uint8_t>>(*plain_bytes);
+
+    {
+        std::scoped_lock _{g_virtual_loader_mutex};
+        g_virtual_payload_cache.source_path = source_path_text;
+        g_virtual_payload_cache.write_time = write_time;
+        g_virtual_payload_cache.payload = prepared.payload;
+        g_virtual_payload_cache.random_access_view = nullptr;
+    }
+
+    std::ostringstream oss;
+    oss << "virtual-loader-payload-ready source=" << narrow_utf8(source_path_text)
+        << " plain_size=0x" << std::hex << prepared.payload->size()
+        << "\n";
+    append_log_line(oss.str());
+
+    return prepared;
+}
+
+std::optional<PreparedVirtualPakSource> load_virtual_pak_payload() {
     VirtualPakLoaderConfig config{};
     {
         std::scoped_lock _{g_virtual_loader_mutex};
@@ -1737,73 +2324,9 @@ std::optional<std::shared_ptr<std::vector<uint8_t>>> load_virtual_pak_payload() 
         return std::nullopt;
     }
 
-    const std::filesystem::path source_path{config.source_path};
-    std::error_code ec{};
-    const auto write_time = std::filesystem::last_write_time(source_path, ec);
-    if (ec) {
-        std::ostringstream oss;
-        oss << "virtual-loader-source-missing path=" << narrow_utf8(config.source_path)
-            << " ec=" << ec.value()
-            << "\n";
-        append_log_line(oss.str());
-        return std::nullopt;
-    }
-
-    {
-        std::scoped_lock _{g_virtual_loader_mutex};
-        if (g_virtual_payload_cache.payload &&
-            g_virtual_payload_cache.source_path == config.source_path &&
-            g_virtual_payload_cache.write_time == write_time) {
-            return g_virtual_payload_cache.payload;
-        }
-    }
-
-    const auto file_bytes = read_binary_file(source_path);
-    if (!file_bytes.has_value()) {
-        append_log_line("virtual-loader-source-read-failed\n");
-        return std::nullopt;
-    }
-
-    if (config.plain_source) {
-        const auto payload = std::make_shared<std::vector<uint8_t>>(*file_bytes);
-
-        {
-            std::scoped_lock _{g_virtual_loader_mutex};
-            g_virtual_payload_cache.source_path = config.source_path;
-            g_virtual_payload_cache.write_time = write_time;
-            g_virtual_payload_cache.payload = payload;
-        }
-
-        std::ostringstream oss;
-        oss << "virtual-loader-plain-payload-ready source=" << narrow_utf8(config.source_path)
-            << " size=0x" << std::hex << payload->size()
-            << "\n";
-        append_log_line(oss.str());
-
-        return payload;
-    }
-
-    const auto plain_bytes = decode_encrypted_pak_bytes(*file_bytes);
-    if (!plain_bytes.has_value()) {
-        return std::nullopt;
-    }
-
-    const auto payload = std::make_shared<std::vector<uint8_t>>(*plain_bytes);
-
-    {
-        std::scoped_lock _{g_virtual_loader_mutex};
-        g_virtual_payload_cache.source_path = config.source_path;
-        g_virtual_payload_cache.write_time = write_time;
-        g_virtual_payload_cache.payload = payload;
-    }
-
-    std::ostringstream oss;
-    oss << "virtual-loader-payload-ready source=" << narrow_utf8(config.source_path)
-        << " plain_size=0x" << std::hex << payload->size()
-        << "\n";
-    append_log_line(oss.str());
-
-    return payload;
+    const auto extension = std::filesystem::path{config.source_path}.extension().wstring();
+    const auto treat_as_plain_source = config.plain_source || _wcsicmp(extension.c_str(), L".pak") == 0;
+    return load_virtual_pak_payload_for_source(config.source_path, treat_as_plain_source);
 }
 
 std::optional<std::wstring> ensure_runtime_source_path_prepared() {
@@ -1862,9 +2385,18 @@ std::optional<std::wstring> ensure_runtime_source_path_prepared() {
         std::filesystem::copy_file(source_path, staged_path, std::filesystem::copy_options::overwrite_existing, ec);
         stage_ok = !ec;
     } else {
-        const auto payload = load_virtual_pak_payload();
-        if (payload.has_value()) {
-            stage_ok = write_binary_file(staged_path, **payload);
+        const auto source = load_virtual_pak_payload();
+        if (source.has_value()) {
+            std::shared_ptr<std::vector<uint8_t>> staged_payload{};
+            if (source->payload != nullptr) {
+                staged_payload = source->payload;
+            } else if (source->random_access_view != nullptr) {
+                staged_payload = ensure_virtual_payload_materialized(source->random_access_view);
+            }
+
+            if (staged_payload != nullptr) {
+                stage_ok = write_binary_file(staged_path, *staged_payload);
+            }
         }
     }
 

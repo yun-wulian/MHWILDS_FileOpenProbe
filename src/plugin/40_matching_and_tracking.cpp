@@ -34,7 +34,11 @@ bool path_matches_record_target(LPCWSTR file_name) {
 
 std::optional<VirtualPakLoaderConfig> current_virtual_loader_config() {
     std::scoped_lock _{g_virtual_loader_mutex};
-    if (!g_virtual_loader_config.enabled || g_virtual_loader_config.record_only || g_virtual_loader_config.source_path.empty()) {
+    if (!g_virtual_loader_config.enabled || g_virtual_loader_config.record_only) {
+        return std::nullopt;
+    }
+
+    if (g_virtual_loader_config.source_path.empty() && !g_virtual_loader_config.rf_chain_mode) {
         return std::nullopt;
     }
 
@@ -48,7 +52,7 @@ std::optional<std::wstring> current_virtual_source_path() {
 HANDLE create_virtual_file_handle(
     const std::wstring& requested_path,
     const std::wstring& source_path,
-    std::shared_ptr<std::vector<uint8_t>> payload,
+    const PreparedVirtualPakSource& source,
     HANDLE backing_handle) {
     auto handle = backing_handle;
     const auto synthetic_handle = handle == nullptr || handle == INVALID_HANDLE_VALUE;
@@ -61,7 +65,8 @@ HANDLE create_virtual_file_handle(
     VirtualPakHandleState state{};
     state.requested_path = requested_path;
     state.source_path = source_path;
-    state.payload = std::move(payload);
+    state.payload = source.payload;
+    state.random_access_view = source.random_access_view;
     state.position = 0;
     state.synthetic_handle = synthetic_handle;
 
@@ -285,7 +290,15 @@ std::optional<uint64_t> lookup_pak_handle_size(HANDLE handle) {
     std::scoped_lock _{g_handle_mutex};
     const auto virtual_it = g_virtual_pak_handles.find(handle_key(handle));
     if (virtual_it != g_virtual_pak_handles.end()) {
-        return virtual_it->second.payload != nullptr ? virtual_it->second.payload->size() : 0ULL;
+        if (virtual_it->second.payload != nullptr) {
+            return virtual_it->second.payload->size();
+        }
+
+        if (virtual_it->second.random_access_view != nullptr) {
+            return virtual_it->second.random_access_view->header.plain_size;
+        }
+
+        return 0ULL;
     }
 
     const auto it = g_pak_handle_sizes.find(handle_key(handle));
@@ -308,6 +321,27 @@ void set_pak_handle_size(HANDLE handle, uint64_t size) {
     }
 
     g_pak_handle_sizes[handle_key(handle)] = size;
+}
+
+std::optional<uint32_t> claim_pak_read_dump_slot(HANDLE handle) {
+    if (handle == nullptr || handle == INVALID_HANDLE_VALUE) {
+        return std::nullopt;
+    }
+
+    std::scoped_lock _{g_handle_mutex};
+    const auto key = handle_key(handle);
+    if (g_pak_handle_paths.find(key) == g_pak_handle_paths.end()
+        && g_virtual_pak_handles.find(key) == g_virtual_pak_handles.end()) {
+        return std::nullopt;
+    }
+
+    auto& count = g_pak_read_dump_counts[key];
+    if (count >= 2) {
+        return std::nullopt;
+    }
+
+    ++count;
+    return count;
 }
 
 std::optional<uint64_t> apply_signed_offset(uint64_t base, int64_t delta) {
@@ -351,6 +385,49 @@ std::optional<std::wstring> lookup_mapping_handle_path(HANDLE mapping_handle) {
     return it->second;
 }
 
+bool clone_handle_tracking(HANDLE source_handle, HANDLE target_handle) {
+    if (source_handle == nullptr || source_handle == INVALID_HANDLE_VALUE ||
+        target_handle == nullptr || target_handle == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    std::scoped_lock _{g_handle_mutex};
+    const auto source_key = handle_key(source_handle);
+    const auto target_key = handle_key(target_handle);
+    auto cloned = false;
+
+    if (const auto it = g_pak_handle_paths.find(source_key); it != g_pak_handle_paths.end()) {
+        g_pak_handle_paths[target_key] = it->second;
+        cloned = true;
+    }
+    if (const auto it = g_pak_handle_positions.find(source_key); it != g_pak_handle_positions.end()) {
+        g_pak_handle_positions[target_key] = it->second;
+        cloned = true;
+    }
+    if (const auto it = g_pak_handle_sizes.find(source_key); it != g_pak_handle_sizes.end()) {
+        g_pak_handle_sizes[target_key] = it->second;
+        cloned = true;
+    }
+    if (const auto it = g_pak_read_dump_counts.find(source_key); it != g_pak_read_dump_counts.end()) {
+        g_pak_read_dump_counts[target_key] = it->second;
+        cloned = true;
+    }
+    if (const auto it = g_mapping_handle_paths.find(source_key); it != g_mapping_handle_paths.end()) {
+        g_mapping_handle_paths[target_key] = it->second;
+        cloned = true;
+    }
+    if (const auto it = g_virtual_pak_handles.find(source_key); it != g_virtual_pak_handles.end()) {
+        g_virtual_pak_handles[target_key] = it->second;
+        cloned = true;
+    }
+    if (const auto it = g_virtual_mapping_handles.find(source_key); it != g_virtual_mapping_handles.end()) {
+        g_virtual_mapping_handles[target_key] = it->second;
+        cloned = true;
+    }
+
+    return cloned;
+}
+
 void untrack_close_handle(HANDLE handle) {
     if (handle == nullptr || handle == INVALID_HANDLE_VALUE) {
         return;
@@ -361,6 +438,7 @@ void untrack_close_handle(HANDLE handle) {
     g_pak_handle_paths.erase(key);
     g_pak_handle_positions.erase(key);
     g_pak_handle_sizes.erase(key);
+    g_pak_read_dump_counts.erase(key);
     g_mapping_handle_paths.erase(key);
     g_virtual_pak_handles.erase(key);
     g_virtual_mapping_handles.erase(key);
@@ -590,7 +668,15 @@ std::optional<std::shared_ptr<std::vector<uint8_t>>> lookup_virtual_payload(HAND
         return std::nullopt;
     }
 
-    return it->second.payload;
+    if (it->second.payload != nullptr) {
+        return it->second.payload;
+    }
+
+    if (it->second.random_access_view != nullptr && it->second.random_access_view->materialized_payload != nullptr) {
+        return it->second.random_access_view->materialized_payload;
+    }
+
+    return std::nullopt;
 }
 
 std::optional<VirtualPakHandleState> lookup_virtual_pak_state(HANDLE handle) {

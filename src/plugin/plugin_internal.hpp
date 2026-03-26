@@ -24,6 +24,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -50,6 +51,7 @@ namespace mhwilds::probe {
 
 inline constexpr wchar_t kLogRelativePath[] = L"mhwilds_version_proxy.log";
 inline constexpr wchar_t kTraceLogRelativePath[] = L"mhwilds_instruction_trace.log";
+inline constexpr wchar_t kReadBytesLogRelativePath[] = L"mhwilds_read_bytes.log";
 inline constexpr wchar_t kLoaderConfigRelativePath[] = L"mhwilds_virtual_pak_loader.ini";
 
 inline constexpr wchar_t kFocusPakPathFragment[] = L"\\pak_mods\\";
@@ -89,6 +91,8 @@ inline constexpr int kWatchBreakpointSlotOwner2A0 = 2;
 
 using CreateFileWFn = HANDLE(WINAPI*)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
 using ReadFileFn = BOOL(WINAPI*)(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED);
+using ReadFileExFn = BOOL(WINAPI*)(HANDLE, LPVOID, DWORD, LPOVERLAPPED, LPOVERLAPPED_COMPLETION_ROUTINE);
+using GetOverlappedResultFn = BOOL(WINAPI*)(HANDLE, LPOVERLAPPED, LPDWORD, BOOL);
 using SetFilePointerExFn = BOOL(WINAPI*)(HANDLE, LARGE_INTEGER, PLARGE_INTEGER, DWORD);
 using GetFileSizeExFn = BOOL(WINAPI*)(HANDLE, PLARGE_INTEGER);
 using GetFileTypeFn = DWORD(WINAPI*)(HANDLE);
@@ -97,7 +101,11 @@ using GetFileInformationByHandleExFn = BOOL(WINAPI*)(HANDLE, FILE_INFO_BY_HANDLE
 using CreateFileMappingWFn = HANDLE(WINAPI*)(HANDLE, LPSECURITY_ATTRIBUTES, DWORD, DWORD, DWORD, LPCWSTR);
 using MapViewOfFileFn = LPVOID(WINAPI*)(HANDLE, DWORD, DWORD, DWORD, SIZE_T);
 using CloseHandleFn = BOOL(WINAPI*)(HANDLE);
+using DuplicateHandleFn = BOOL(WINAPI*)(HANDLE, HANDLE, HANDLE, LPHANDLE, DWORD, BOOL, DWORD);
+using ReOpenFileFn = HANDLE(WINAPI*)(HANDLE, DWORD, DWORD, DWORD);
+using GetFinalPathNameByHandleWFn = DWORD(WINAPI*)(HANDLE, LPWSTR, DWORD, DWORD);
 using NtQueryInformationFileFn = NTSTATUS(NTAPI*)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, FILE_INFORMATION_CLASS);
+using NtReadFileFn = NTSTATUS(NTAPI*)(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID, PIO_STATUS_BLOCK, PVOID, ULONG, PLARGE_INTEGER, PULONG);
 using DirectStorageOpenFn = int64_t(__fastcall*)(void* rcx, const void* rdx, void* r8, void* r9);
 
 enum class HwBreakpointType : uint8_t {
@@ -125,6 +133,7 @@ struct VirtualPakLoaderConfig {
     bool backend_only{};
     bool record_only{};
     bool rf_chain_mode{};
+    bool probe_only{};
     bool reframework_pak_dir_enabled{};
     bool plain_source{};
     bool passthrough{};
@@ -152,6 +161,7 @@ struct VirtualPakHandleState {
     std::wstring requested_path{};
     std::wstring source_path{};
     std::shared_ptr<std::vector<uint8_t>> payload{};
+    std::shared_ptr<struct VirtualPakRandomAccessView> random_access_view{};
     uint64_t position{};
     bool synthetic_handle{true};
 };
@@ -162,10 +172,48 @@ struct VirtualMappingHandleState {
     bool synthetic_handle{true};
 };
 
+struct VirtualPakRandomAccessView {
+    std::wstring source_path{};
+    std::filesystem::file_time_type write_time{};
+    encrypted_pak::HeaderV2 header{};
+    uint32_t chunk_plain_size{};
+    uint64_t full_chunk_cipher_size{};
+    uint64_t full_chunk_record_size{};
+    uint64_t chunk_count{};
+    std::array<uint8_t, 32> encryption_key{};
+    std::array<uint8_t, 32> authentication_key{};
+    std::mutex cache_mutex{};
+    std::optional<uint64_t> cached_chunk_index{};
+    std::shared_ptr<std::vector<uint8_t>> cached_chunk{};
+    std::shared_ptr<std::vector<uint8_t>> materialized_payload{};
+};
+
+struct PreparedVirtualPakSource {
+    std::shared_ptr<std::vector<uint8_t>> payload{};
+    std::shared_ptr<VirtualPakRandomAccessView> random_access_view{};
+
+    [[nodiscard]] bool empty() const {
+        return payload == nullptr && random_access_view == nullptr;
+    }
+
+    [[nodiscard]] uint64_t plain_size() const {
+        if (payload != nullptr) {
+            return payload->size();
+        }
+
+        if (random_access_view != nullptr) {
+            return random_access_view->header.plain_size;
+        }
+
+        return 0;
+    }
+};
+
 struct VirtualPakPayloadCache {
     std::wstring source_path{};
     std::filesystem::file_time_type write_time{};
     std::shared_ptr<std::vector<uint8_t>> payload{};
+    std::shared_ptr<VirtualPakRandomAccessView> random_access_view{};
 };
 
 struct VirtualPakStageCache {
@@ -245,6 +293,8 @@ extern REFrameworkPluginFunctions g_ref;
 
 extern CreateFileWFn g_original_create_file_w;
 extern ReadFileFn g_original_read_file;
+extern ReadFileExFn g_original_read_file_ex;
+extern GetOverlappedResultFn g_original_get_overlapped_result;
 extern SetFilePointerExFn g_original_set_file_pointer_ex;
 extern GetFileSizeExFn g_original_get_file_size_ex;
 extern GetFileTypeFn g_original_get_file_type;
@@ -253,7 +303,11 @@ extern GetFileInformationByHandleExFn g_original_get_file_information_by_handle_
 extern CreateFileMappingWFn g_original_create_file_mapping_w;
 extern MapViewOfFileFn g_original_map_view_of_file;
 extern CloseHandleFn g_original_close_handle;
+extern DuplicateHandleFn g_original_duplicate_handle;
+extern ReOpenFileFn g_original_re_open_file;
+extern GetFinalPathNameByHandleWFn g_original_get_final_path_name_by_handle_w;
 extern NtQueryInformationFileFn g_original_nt_query_information_file;
+extern NtReadFileFn g_original_nt_read_file;
 extern DirectStorageOpenFn g_original_directstorage_open;
 
 extern std::mutex g_log_mutex;
@@ -277,6 +331,8 @@ extern std::atomic<bool> g_update_check_thread_started;
 extern std::atomic<bool> g_update_prompt_thread_running;
 extern std::atomic<uint64_t> g_create_file_pak_hits;
 extern std::atomic<uint64_t> g_read_file_hits;
+extern std::atomic<uint64_t> g_read_file_ex_hits;
+extern std::atomic<uint64_t> g_get_overlapped_result_hits;
 extern std::atomic<uint64_t> g_set_file_pointer_hits;
 extern std::atomic<uint64_t> g_get_file_size_hits;
 extern std::atomic<uint64_t> g_get_file_type_hits;
@@ -285,7 +341,11 @@ extern std::atomic<uint64_t> g_get_file_info_ex_hits;
 extern std::atomic<uint64_t> g_create_file_mapping_hits;
 extern std::atomic<uint64_t> g_map_view_of_file_hits;
 extern std::atomic<uint64_t> g_close_handle_hits;
+extern std::atomic<uint64_t> g_duplicate_handle_hits;
+extern std::atomic<uint64_t> g_re_open_file_hits;
+extern std::atomic<uint64_t> g_get_final_path_name_hits;
 extern std::atomic<uint64_t> g_nt_query_info_hits;
+extern std::atomic<uint64_t> g_nt_read_file_hits;
 extern std::atomic<uint64_t> g_directstorage_hits;
 extern std::atomic<uint64_t> g_redirect_createfile_breakpoint_hits;
 extern std::atomic<bool> g_same_point_hooks_installed;
@@ -296,6 +356,8 @@ extern std::atomic<bool> g_startup_gate_wait_logged;
 extern uintptr_t g_game_module_base;
 extern void* g_create_file_target;
 extern void* g_read_file_target;
+extern void* g_read_file_ex_target;
+extern void* g_get_overlapped_result_target;
 extern void* g_set_file_pointer_ex_target;
 extern void* g_get_file_size_ex_target;
 extern void* g_get_file_type_target;
@@ -304,7 +366,11 @@ extern void* g_get_file_information_by_handle_ex_target;
 extern void* g_create_file_mapping_w_target;
 extern void* g_map_view_of_file_target;
 extern void* g_close_handle_target;
+extern void* g_duplicate_handle_target;
+extern void* g_re_open_file_target;
+extern void* g_get_final_path_name_by_handle_w_target;
 extern void* g_nt_query_information_file_target;
+extern void* g_nt_read_file_target;
 extern void* g_directstorage_target;
 extern uintptr_t g_directstorage_global_ptr_addr;
 
@@ -318,6 +384,7 @@ extern SafetyHookMid g_same_point_patch_version_hook;
 extern std::unordered_map<uintptr_t, std::wstring> g_pak_handle_paths;
 extern std::unordered_map<uintptr_t, uint64_t> g_pak_handle_positions;
 extern std::unordered_map<uintptr_t, uint64_t> g_pak_handle_sizes;
+extern std::unordered_map<uintptr_t, uint32_t> g_pak_read_dump_counts;
 extern std::unordered_map<uintptr_t, std::wstring> g_mapping_handle_paths;
 extern std::unordered_map<uintptr_t, VirtualPakHandleState> g_virtual_pak_handles;
 extern std::unordered_map<uintptr_t, VirtualMappingHandleState> g_virtual_mapping_handles;
@@ -389,12 +456,15 @@ std::string narrow_utf8(const std::wstring& value);
 std::optional<std::wstring> widen_utf8(const std::string& value);
 std::filesystem::path log_path();
 std::filesystem::path trace_log_path();
+std::filesystem::path read_bytes_log_path();
 std::filesystem::path loader_config_path();
 uint64_t process_uptime_ms();
 void open_log_if_needed();
 void open_trace_log_if_needed();
 void append_log_line(const std::string& line);
 void append_trace_log_line(const std::string& line);
+void append_read_bytes_log_line(const std::string& line);
+void append_read_bytes_log_bytes(const void* buffer, size_t count);
 void append_timing_log_line(const char* event_name, std::string_view details = {});
 
 bool read_memory_block_safe(const void* src, void* dst, size_t size);
@@ -410,6 +480,9 @@ int scan_highest_native_patch_num();
 int compute_desired_patch_version();
 const char* virtual_loader_mode_to_string(const VirtualPakLoaderConfig& config);
 std::optional<std::wstring> resolve_redirect_source_for_requested_path(std::wstring_view requested_path);
+bool should_defer_rf_chain_virtual_backend_rewrite(
+    const VirtualPakLoaderConfig& config,
+    const std::optional<std::wstring>& redirected_path);
 bool install_patch_version_breakpoint();
 void uninstall_patch_version_breakpoint();
 bool looks_like_wide_string_at(const wchar_t* text);
@@ -442,7 +515,10 @@ std::vector<std::wstring> stage_selected_encrypted_mods_into_local_dir(
     const VirtualPakLoaderConfig& config,
     const std::vector<std::wstring>& encrypted_source_paths);
 std::vector<std::wstring> stage_encrypted_custom_mods_into_local_dir(const VirtualPakLoaderConfig& config);
-std::optional<std::shared_ptr<std::vector<uint8_t>>> load_virtual_pak_payload();
+std::optional<PreparedVirtualPakSource> load_virtual_pak_payload_for_source(
+    const std::wstring& source_path,
+    bool plain_source);
+std::optional<PreparedVirtualPakSource> load_virtual_pak_payload();
 std::optional<std::wstring> ensure_runtime_source_path_prepared();
 void cleanup_staged_runtime_source();
 bool path_matches_virtual_target_locked(const std::wstring& normalized_path, const VirtualPakLoaderConfig& config);
@@ -458,7 +534,7 @@ std::optional<std::wstring> current_virtual_source_path();
 HANDLE create_virtual_file_handle(
     const std::wstring& requested_path,
     const std::wstring& source_path,
-    std::shared_ptr<std::vector<uint8_t>> payload,
+    const PreparedVirtualPakSource& source,
     HANDLE backing_handle = nullptr);
 HANDLE create_virtual_mapping_handle(
     const std::wstring& path,
@@ -479,8 +555,10 @@ std::optional<uint64_t> lookup_pak_handle_position(HANDLE handle);
 void set_pak_handle_position(HANDLE handle, uint64_t position);
 std::optional<uint64_t> lookup_pak_handle_size(HANDLE handle);
 void set_pak_handle_size(HANDLE handle, uint64_t size);
+std::optional<uint32_t> claim_pak_read_dump_slot(HANDLE handle);
 void track_mapping_handle(HANDLE mapping_handle, const std::wstring& path);
 std::optional<std::wstring> lookup_mapping_handle_path(HANDLE mapping_handle);
+bool clone_handle_tracking(HANDLE source_handle, HANDLE target_handle);
 void untrack_close_handle(HANDLE handle);
 bool ensure_minhook_initialized();
 bool install_named_hook(void* target, void* detour, void** original, const char* label);
@@ -494,6 +572,13 @@ std::optional<std::shared_ptr<std::vector<uint8_t>>> lookup_virtual_payload(HAND
 std::optional<VirtualPakHandleState> lookup_virtual_pak_state(HANDLE handle);
 std::optional<std::wstring> lookup_virtual_source_path(HANDLE handle);
 std::optional<VirtualMappingHandleState> lookup_virtual_mapping(HANDLE handle);
+std::shared_ptr<std::vector<uint8_t>> ensure_virtual_payload_materialized(
+    const std::shared_ptr<VirtualPakRandomAccessView>& view);
+std::optional<size_t> read_virtual_pak_view_bytes(
+    const std::shared_ptr<VirtualPakRandomAccessView>& view,
+    uint64_t read_offset,
+    void* buffer,
+    size_t bytes_to_read);
 FILETIME virtual_filetime_now();
 LONGLONG filetime_to_large_integer(const FILETIME& filetime);
 uint64_t virtual_file_id(HANDLE handle);

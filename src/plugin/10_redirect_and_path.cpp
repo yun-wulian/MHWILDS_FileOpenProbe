@@ -275,6 +275,9 @@ const char* virtual_loader_mode_to_string(const VirtualPakLoaderConfig& config) 
     if (config.record_only) {
         return "record_only";
     }
+    if (config.rf_chain_mode && config.probe_only) {
+        return "rf_probe";
+    }
     if (config.rf_chain_mode) {
         return "rf_chain";
     }
@@ -298,6 +301,17 @@ const char* virtual_loader_mode_to_string(const VirtualPakLoaderConfig& config) 
     }
 
     return "virtual";
+}
+
+bool should_defer_rf_chain_virtual_backend_rewrite(
+    const VirtualPakLoaderConfig& config,
+    const std::optional<std::wstring>& redirected_path) {
+    if (!config.rf_chain_mode || config.stage_source || !redirected_path.has_value() || redirected_path->empty()) {
+        return false;
+    }
+
+    const auto extension = std::filesystem::path{*redirected_path}.extension().wstring();
+    return _wcsicmp(extension.c_str(), kEncryptedModExtension) == 0;
 }
 
 bool write_breakpoint_byte(uintptr_t address, uint8_t value) {
@@ -409,6 +423,24 @@ bool handle_redirect_createfile_breakpoint(EXCEPTION_POINTERS* exception_info, u
         return false;
     }
 
+    VirtualPakLoaderConfig config{};
+    {
+        std::scoped_lock _{g_virtual_loader_mutex};
+        config = g_virtual_loader_config;
+    }
+
+    if (should_defer_rf_chain_virtual_backend_rewrite(config, redirected_path)) {
+        std::ostringstream oss;
+        oss << "redirect-breakpoint-deferred"
+            << " kind=createfile"
+            << " addr=0x" << std::hex << address
+            << " requested=" << narrow_utf8(requested_path)
+            << " source=" << narrow_utf8(*redirected_path)
+            << "\n";
+        append_log_line(oss.str());
+        return false;
+    }
+
     t_redirect_source_path_storage = *redirected_path;
     exception_info->ContextRecord->Rcx = reinterpret_cast<uint64_t>(t_redirect_source_path_storage.c_str());
 
@@ -440,6 +472,24 @@ bool handle_redirect_directstorage_breakpoint(EXCEPTION_POINTERS* exception_info
 
     const auto redirected_path = resolve_redirect_source_for_requested_path(*requested_path);
     if (!redirected_path.has_value()) {
+        return false;
+    }
+
+    VirtualPakLoaderConfig config{};
+    {
+        std::scoped_lock _{g_virtual_loader_mutex};
+        config = g_virtual_loader_config;
+    }
+
+    if (should_defer_rf_chain_virtual_backend_rewrite(config, redirected_path)) {
+        std::ostringstream oss;
+        oss << "redirect-breakpoint-deferred"
+            << " kind=directstorage"
+            << " addr=0x" << std::hex << address
+            << " requested=" << narrow_utf8(*requested_path)
+            << " source=" << narrow_utf8(*redirected_path)
+            << "\n";
+        append_log_line(oss.str());
         return false;
     }
 
@@ -667,6 +717,15 @@ void same_point_patch_version_hook(SafetyHookContext& context) {
     }
 #endif
 
+    VirtualPakLoaderConfig config{};
+    {
+        std::scoped_lock _{g_virtual_loader_mutex};
+        config = g_virtual_loader_config;
+    }
+    if (config.probe_only) {
+        return;
+    }
+
     auto* reg = select_patch_version_register(&context, g_patch_version_source_reg);
     const auto desired_patch = compute_desired_patch_version();
     if (reg != nullptr && desired_patch >= 0 && *reg < static_cast<uint64_t>(desired_patch)) {
@@ -688,8 +747,45 @@ void same_point_createfile_hook(SafetyHookContext& context) {
         return;
     }
 
-    const auto redirected_path = resolve_redirect_source_for_requested_path(requested_path);
+    const auto requested_path_text = read_wide_string_safe(requested_path);
+    const auto redirected_path = resolve_redirect_source_for_requested_path(requested_path_text);
+    VirtualPakLoaderConfig config{};
+    {
+        std::scoped_lock _{g_virtual_loader_mutex};
+        config = g_virtual_loader_config;
+    }
+    if (config.probe_only) {
+        const auto is_pak = path_looks_like_pak(requested_path_text.c_str());
+        const auto focus_target = path_matches_focus_target(requested_path_text);
+        if (!is_pak) {
+            return;
+        }
+
+        std::ostringstream oss;
+        oss << "same-point-createfile-probe"
+            << " pak=1"
+            << " focus_target=" << static_cast<int>(focus_target)
+            << " redirect_candidate=" << static_cast<int>(redirected_path.has_value())
+            << " requested=" << narrow_utf8(requested_path_text);
+        if (redirected_path.has_value()) {
+            oss << " candidate=" << narrow_utf8(*redirected_path);
+        }
+        oss << "\n";
+        append_log_line(oss.str());
+        return;
+    }
+
     if (!redirected_path.has_value()) {
+        return;
+    }
+
+    if (should_defer_rf_chain_virtual_backend_rewrite(config, redirected_path)) {
+        std::ostringstream oss;
+        oss << "same-point-createfile-deferred"
+            << " requested=" << narrow_utf8(requested_path_text)
+            << " source=" << narrow_utf8(*redirected_path)
+            << "\n";
+        append_log_line(oss.str());
         return;
     }
 
@@ -698,7 +794,7 @@ void same_point_createfile_hook(SafetyHookContext& context) {
 
     std::ostringstream oss;
     oss << "same-point-createfile-redirect"
-        << " requested=" << narrow_utf8(requested_path)
+        << " requested=" << narrow_utf8(requested_path_text)
         << " rewritten=" << narrow_utf8(t_redirect_source_path_storage)
         << "\n";
     append_log_line(oss.str());
@@ -712,7 +808,43 @@ void same_point_directstorage_hook(SafetyHookContext& context) {
     }
 
     const auto redirected_path = resolve_redirect_source_for_requested_path(*extracted_path);
+    VirtualPakLoaderConfig config{};
+    {
+        std::scoped_lock _{g_virtual_loader_mutex};
+        config = g_virtual_loader_config;
+    }
+    if (config.probe_only) {
+        const auto is_pak = path_looks_like_pak(extracted_path->c_str());
+        const auto focus_target = path_matches_focus_target(*extracted_path);
+        if (!is_pak) {
+            return;
+        }
+
+        std::ostringstream oss;
+        oss << "same-point-directstorage-probe"
+            << " pak=1"
+            << " focus_target=" << static_cast<int>(focus_target)
+            << " redirect_candidate=" << static_cast<int>(redirected_path.has_value())
+            << " requested=" << narrow_utf8(*extracted_path);
+        if (redirected_path.has_value()) {
+            oss << " candidate=" << narrow_utf8(*redirected_path);
+        }
+        oss << "\n";
+        append_log_line(oss.str());
+        return;
+    }
+
     if (!redirected_path.has_value()) {
+        return;
+    }
+
+    if (should_defer_rf_chain_virtual_backend_rewrite(config, redirected_path)) {
+        std::ostringstream oss;
+        oss << "same-point-directstorage-deferred"
+            << " requested=" << narrow_utf8(*extracted_path)
+            << " source=" << narrow_utf8(*redirected_path)
+            << "\n";
+        append_log_line(oss.str());
         return;
     }
 
