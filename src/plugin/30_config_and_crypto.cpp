@@ -178,95 +178,101 @@ std::vector<std::wstring> resolve_effective_rf_chain_pak_paths(const VirtualPakL
 VirtualPakLoaderConfig load_virtual_loader_config_from_disk() {
     VirtualPakLoaderConfig config{};
     const auto config_file = loader_config_path();
+    const auto has_loader_config = std::filesystem::exists(config_file);
 
-    if (!std::filesystem::exists(config_file)) {
-        return config;
+    if (!has_loader_config) {
+        // Single-DLL deployments should default to the stable RF chain path instead of a zeroed no-op config.
+        config.enabled = true;
+        config.rf_chain_mode = true;
+        config.reframework_pak_dir_enabled = true;
     }
 
-    ScopedInternalBackendOpen internal_open_guard{};
-    std::ifstream input(config_file, std::ios::binary);
-    if (!input) {
-        return config;
-    }
-
-    std::string line{};
-    while (std::getline(input, line)) {
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
+    if (has_loader_config) {
+        ScopedInternalBackendOpen internal_open_guard{};
+        std::ifstream input(config_file, std::ios::binary);
+        if (!input) {
+            return config;
         }
 
-        const auto trimmed = trim_ascii_copy(line);
-        if (trimmed.empty() || trimmed[0] == '#' || trimmed[0] == ';') {
-            continue;
-        }
-
-        const auto delimiter = trimmed.find('=');
-        if (delimiter == std::string::npos) {
-            continue;
-        }
-
-        const auto key = trim_ascii_copy(trimmed.substr(0, delimiter));
-        const auto value = trim_ascii_copy(trimmed.substr(delimiter + 1));
-        const auto wide_value = widen_utf8(value);
-        if (!wide_value.has_value()) {
-            continue;
-        }
-
-        if (_stricmp(key.c_str(), "enabled") == 0) {
-            config.enabled = parse_bool_value(value);
-        } else if (_stricmp(key.c_str(), "observer_only") == 0) {
-            config.observer_only = parse_bool_value(value);
-        } else if (_stricmp(key.c_str(), "backend_only") == 0) {
-            config.backend_only = parse_bool_value(value);
-        } else if (_stricmp(key.c_str(), "record_only") == 0) {
-            config.record_only = parse_bool_value(value);
-        } else if (_stricmp(key.c_str(), "plain_source") == 0) {
-            config.plain_source = parse_bool_value(value);
-        } else if (_stricmp(key.c_str(), "stage_source") == 0) {
-            config.stage_source = parse_bool_value(value);
-        } else if (_stricmp(key.c_str(), "keep_staged_file") == 0) {
-            config.keep_staged_file = parse_bool_value(value);
-        } else if (_stricmp(key.c_str(), "trace_enabled") == 0) {
-            config.trace_enabled = parse_bool_value(value);
-        } else if (_stricmp(key.c_str(), "trace_start_rva") == 0) {
-            if (const auto parsed = parse_u64_value(value); parsed.has_value()) {
-                config.trace_start_rva = static_cast<uintptr_t>(*parsed);
+        std::string line{};
+        while (std::getline(input, line)) {
+            if (!line.empty() && line.back() == '\r') {
+                line.pop_back();
             }
-        } else if (_stricmp(key.c_str(), "trace_max_instructions") == 0) {
-            if (const auto parsed = parse_u64_value(value); parsed.has_value()) {
-                config.trace_max_instructions = static_cast<uint32_t>(std::max<uint64_t>(1, *parsed));
+
+            const auto trimmed = trim_ascii_copy(line);
+            if (trimmed.empty() || trimmed[0] == '#' || trimmed[0] == ';') {
+                continue;
             }
-        } else if (_stricmp(key.c_str(), "mode") == 0) {
-            config.observer_only = _stricmp(value.c_str(), "observer") == 0 || _stricmp(value.c_str(), "observe") == 0 || _stricmp(value.c_str(), "logonly") == 0;
-            config.backend_only = _stricmp(value.c_str(), "backend") == 0 || _stricmp(value.c_str(), "backend_only") == 0 || _stricmp(value.c_str(), "minimal") == 0;
-            config.record_only = _stricmp(value.c_str(), "record") == 0 || _stricmp(value.c_str(), "record_only") == 0 || _stricmp(value.c_str(), "trace") == 0 || _stricmp(value.c_str(), "monitor") == 0;
-            config.rf_chain_mode = _stricmp(value.c_str(), "rf_chain") == 0 || _stricmp(value.c_str(), "reframework_chain") == 0 || _stricmp(value.c_str(), "extend") == 0;
-            config.plain_source = _stricmp(value.c_str(), "backend_plaintext") == 0 || _stricmp(value.c_str(), "backend_raw") == 0;
-            config.passthrough = _stricmp(value.c_str(), "passthrough") == 0 || _stricmp(value.c_str(), "real") == 0;
-            config.stage_source =
-                _stricmp(value.c_str(), "stage") == 0 ||
-                _stricmp(value.c_str(), "staged") == 0 ||
-                _stricmp(value.c_str(), "stage_encrypted") == 0 ||
-                _stricmp(value.c_str(), "staged_encrypted") == 0 ||
-                _stricmp(value.c_str(), "stage_plain") == 0 ||
-                _stricmp(value.c_str(), "staged_plain") == 0 ||
-                _stricmp(value.c_str(), "stage_plaintext") == 0 ||
-                _stricmp(value.c_str(), "staged_plaintext") == 0;
-            if (_stricmp(value.c_str(), "stage_plain") == 0 ||
-                _stricmp(value.c_str(), "staged_plain") == 0 ||
-                _stricmp(value.c_str(), "stage_plaintext") == 0 ||
-                _stricmp(value.c_str(), "staged_plaintext") == 0) {
-                config.plain_source = true;
+
+            const auto delimiter = trimmed.find('=');
+            if (delimiter == std::string::npos) {
+                continue;
             }
-            config.redirect = false;
-        } else if (_stricmp(key.c_str(), "target_path") == 0) {
-            config.target_path = *wide_value;
-        } else if (_stricmp(key.c_str(), "source_path") == 0) {
-            config.source_path = *wide_value;
-        } else if (_stricmp(key.c_str(), "custom_pak_dir") == 0) {
-            config.custom_pak_dir = *wide_value;
-        } else if (_stricmp(key.c_str(), "stage_root") == 0) {
-            config.stage_root = *wide_value;
+
+            const auto key = trim_ascii_copy(trimmed.substr(0, delimiter));
+            const auto value = trim_ascii_copy(trimmed.substr(delimiter + 1));
+            const auto wide_value = widen_utf8(value);
+            if (!wide_value.has_value()) {
+                continue;
+            }
+
+            if (_stricmp(key.c_str(), "enabled") == 0) {
+                config.enabled = parse_bool_value(value);
+            } else if (_stricmp(key.c_str(), "observer_only") == 0) {
+                config.observer_only = parse_bool_value(value);
+            } else if (_stricmp(key.c_str(), "backend_only") == 0) {
+                config.backend_only = parse_bool_value(value);
+            } else if (_stricmp(key.c_str(), "record_only") == 0) {
+                config.record_only = parse_bool_value(value);
+            } else if (_stricmp(key.c_str(), "plain_source") == 0) {
+                config.plain_source = parse_bool_value(value);
+            } else if (_stricmp(key.c_str(), "stage_source") == 0) {
+                config.stage_source = parse_bool_value(value);
+            } else if (_stricmp(key.c_str(), "keep_staged_file") == 0) {
+                config.keep_staged_file = parse_bool_value(value);
+            } else if (_stricmp(key.c_str(), "trace_enabled") == 0) {
+                config.trace_enabled = parse_bool_value(value);
+            } else if (_stricmp(key.c_str(), "trace_start_rva") == 0) {
+                if (const auto parsed = parse_u64_value(value); parsed.has_value()) {
+                    config.trace_start_rva = static_cast<uintptr_t>(*parsed);
+                }
+            } else if (_stricmp(key.c_str(), "trace_max_instructions") == 0) {
+                if (const auto parsed = parse_u64_value(value); parsed.has_value()) {
+                    config.trace_max_instructions = static_cast<uint32_t>(std::max<uint64_t>(1, *parsed));
+                }
+            } else if (_stricmp(key.c_str(), "mode") == 0) {
+                config.observer_only = _stricmp(value.c_str(), "observer") == 0 || _stricmp(value.c_str(), "observe") == 0 || _stricmp(value.c_str(), "logonly") == 0;
+                config.backend_only = _stricmp(value.c_str(), "backend") == 0 || _stricmp(value.c_str(), "backend_only") == 0 || _stricmp(value.c_str(), "minimal") == 0;
+                config.record_only = _stricmp(value.c_str(), "record") == 0 || _stricmp(value.c_str(), "record_only") == 0 || _stricmp(value.c_str(), "trace") == 0 || _stricmp(value.c_str(), "monitor") == 0;
+                config.rf_chain_mode = _stricmp(value.c_str(), "rf_chain") == 0 || _stricmp(value.c_str(), "reframework_chain") == 0 || _stricmp(value.c_str(), "extend") == 0;
+                config.plain_source = _stricmp(value.c_str(), "backend_plaintext") == 0 || _stricmp(value.c_str(), "backend_raw") == 0;
+                config.passthrough = _stricmp(value.c_str(), "passthrough") == 0 || _stricmp(value.c_str(), "real") == 0;
+                config.stage_source =
+                    _stricmp(value.c_str(), "stage") == 0 ||
+                    _stricmp(value.c_str(), "staged") == 0 ||
+                    _stricmp(value.c_str(), "stage_encrypted") == 0 ||
+                    _stricmp(value.c_str(), "staged_encrypted") == 0 ||
+                    _stricmp(value.c_str(), "stage_plain") == 0 ||
+                    _stricmp(value.c_str(), "staged_plain") == 0 ||
+                    _stricmp(value.c_str(), "stage_plaintext") == 0 ||
+                    _stricmp(value.c_str(), "staged_plaintext") == 0;
+                if (_stricmp(value.c_str(), "stage_plain") == 0 ||
+                    _stricmp(value.c_str(), "staged_plain") == 0 ||
+                    _stricmp(value.c_str(), "stage_plaintext") == 0 ||
+                    _stricmp(value.c_str(), "staged_plaintext") == 0) {
+                    config.plain_source = true;
+                }
+                config.redirect = false;
+            } else if (_stricmp(key.c_str(), "target_path") == 0) {
+                config.target_path = *wide_value;
+            } else if (_stricmp(key.c_str(), "source_path") == 0) {
+                config.source_path = *wide_value;
+            } else if (_stricmp(key.c_str(), "custom_pak_dir") == 0) {
+                config.custom_pak_dir = *wide_value;
+            } else if (_stricmp(key.c_str(), "stage_root") == 0) {
+                config.stage_root = *wide_value;
+            }
         }
     }
 
@@ -277,7 +283,9 @@ VirtualPakLoaderConfig load_virtual_loader_config_from_disk() {
     ensure_stage_startup_cleanup(config);
     config.target_path_normalized = normalize_path_for_match(config.target_path);
     config.base_patch_num = scan_highest_native_patch_num();
-    config.reframework_pak_dir_enabled = load_reframework_pak_directory_enabled_from_disk();
+    if (has_loader_config || !config.reframework_pak_dir_enabled) {
+        config.reframework_pak_dir_enabled = load_reframework_pak_directory_enabled_from_disk();
+    }
     const auto reframework_custom_paths = resolve_reframework_custom_pak_paths(config.reframework_pak_dir_enabled);
     const auto encrypted_custom_paths = resolve_encrypted_custom_mod_paths();
     const auto local_custom_paths = resolve_local_custom_pak_paths(config);
