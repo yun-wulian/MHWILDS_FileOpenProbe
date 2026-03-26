@@ -7,6 +7,7 @@ constexpr wchar_t kLoaderUpdatePostUrl[] = L"https://www.caimogu.cc/post/2339976
 constexpr int kUpdatePromptOpenButtonId = 1001;
 constexpr int kUpdatePromptIgnoreButtonId = 1002;
 constexpr uint32_t kStartupGateWaitTimeoutMs = 5000;
+constexpr uint32_t kUpdateRetryBackoffMs = 250;
 constexpr size_t kPromptAnnouncementMaxChars = 120;
 
 struct SimpleVersion {
@@ -1147,6 +1148,69 @@ void log_mod_gate_denial(std::wstring_view source_path, const char* reason, std:
     append_log_line(oss.str());
 }
 
+void log_mod_gate_skip_update(std::wstring_view source_path, const char* reason, std::wstring_view detail = {}) {
+    std::ostringstream oss;
+    oss << "mod-gate-skip-update source=" << narrow_utf8(std::wstring{source_path})
+        << " reason=" << (reason != nullptr ? reason : "<null>");
+    if (!detail.empty()) {
+        oss << " detail=" << narrow_utf8(std::wstring{detail});
+    }
+    oss << "\n";
+    append_log_line(oss.str());
+}
+
+std::optional<RemoteUpdateInfo> fetch_remote_update_info_with_retry(
+    std::wstring_view post_url,
+    const char* category,
+    std::chrono::steady_clock::time_point deadline) {
+    size_t attempt = 0;
+    for (;;) {
+        ++attempt;
+        if (auto info = fetch_remote_update_info_from_caimogu_post_url(post_url); info.has_value()) {
+            if (attempt > 1) {
+                std::ostringstream oss;
+                oss << "update-fetch-retry-succeeded category=" << (category != nullptr ? category : "<null>")
+                    << " attempt=" << attempt
+                    << " url=" << narrow_utf8(std::wstring{post_url})
+                    << "\n";
+                append_log_line(oss.str());
+            }
+            return info;
+        }
+
+        if (g_shutdown_requested.load()) {
+            return std::nullopt;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            if (attempt > 1) {
+                std::ostringstream oss;
+                oss << "update-fetch-retry-exhausted category=" << (category != nullptr ? category : "<null>")
+                    << " attempts=" << attempt
+                    << " url=" << narrow_utf8(std::wstring{post_url})
+                    << "\n";
+                append_log_line(oss.str());
+            }
+            return std::nullopt;
+        }
+
+        const auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+        std::ostringstream oss;
+        oss << "update-fetch-retry category=" << (category != nullptr ? category : "<null>")
+            << " attempt=" << attempt
+            << " remaining_ms=" << remaining_ms
+            << " url=" << narrow_utf8(std::wstring{post_url})
+            << "\n";
+        append_log_line(oss.str());
+
+        const auto sleep_ms = std::min<int64_t>(static_cast<int64_t>(kUpdateRetryBackoffMs), remaining_ms);
+        if (sleep_ms > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+        }
+    }
+}
+
 std::optional<VirtualPakLoaderConfig> build_gate_ready_config(const StartupGateSnapshot& snapshot) {
     VirtualPakLoaderConfig config{};
     {
@@ -1159,7 +1223,7 @@ std::optional<VirtualPakLoaderConfig> build_gate_ready_config(const StartupGateS
     return config;
 }
 
-std::optional<RemoteUpdateInfo> fetch_loader_remote_update_info_once() {
+std::optional<RemoteUpdateInfo> fetch_loader_remote_update_info_once(std::chrono::steady_clock::time_point retry_deadline) {
     append_timing_log_line("loader-update-worker-start");
     const auto local_version = parse_simple_version(kLoaderBuildVersion);
     std::optional<RemoteUpdateInfo> cached_info{};
@@ -1175,7 +1239,7 @@ std::optional<RemoteUpdateInfo> fetch_loader_remote_update_info_once() {
         }
     }
 
-    const auto remote_info = fetch_remote_update_info_from_caimogu_post_url(kLoaderUpdatePostUrl);
+    const auto remote_info = fetch_remote_update_info_with_retry(kLoaderUpdatePostUrl, "loader", retry_deadline);
     if (!remote_info.has_value()) {
         if (cached_info.has_value()) {
             enqueue_update_prompt_request(build_loader_update_prompt_request(*cached_info));
@@ -1214,7 +1278,8 @@ std::optional<RemoteUpdateInfo> fetch_loader_remote_update_info_once() {
 }
 
 void run_startup_gate_worker_body() {
-    auto remote_info = fetch_loader_remote_update_info_once();
+    const auto retry_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kStartupGateWaitTimeoutMs);
+    auto remote_info = fetch_loader_remote_update_info_once(retry_deadline);
     if (!remote_info.has_value()) {
         StartupGateSnapshot snapshot{};
         publish_startup_gate_result(StartupGateStatus::TimeoutFallback, std::move(snapshot), std::nullopt, "loader_api_failed");
@@ -1259,24 +1324,24 @@ void run_startup_gate_worker_body() {
         }
 
         if (!metadata->metadata_present) {
-            snapshot.denied_encrypted_source_paths.emplace_back(metadata->source_path);
-            log_mod_gate_denial(metadata->source_path, "metadata_missing");
+            snapshot.approved_encrypted_source_paths.emplace_back(metadata->source_path);
+            log_mod_gate_skip_update(metadata->source_path, "metadata_missing");
             continue;
         }
 
         if (!metadata->authenticated) {
-            snapshot.denied_encrypted_source_paths.emplace_back(metadata->source_path);
-            log_mod_gate_denial(metadata->source_path, "metadata_unauthenticated");
+            snapshot.approved_encrypted_source_paths.emplace_back(metadata->source_path);
+            log_mod_gate_skip_update(metadata->source_path, "metadata_unauthenticated");
             continue;
         }
 
         if (metadata->mod_version.empty() || metadata->update_url.empty()) {
-            snapshot.denied_encrypted_source_paths.emplace_back(metadata->source_path);
-            log_mod_gate_denial(metadata->source_path, "metadata_incomplete");
+            snapshot.approved_encrypted_source_paths.emplace_back(metadata->source_path);
+            log_mod_gate_skip_update(metadata->source_path, "metadata_incomplete");
             continue;
         }
 
-        const auto remote_mod_info = fetch_remote_update_info_from_caimogu_post_url(metadata->update_url);
+        const auto remote_mod_info = fetch_remote_update_info_with_retry(metadata->update_url, "mod", retry_deadline);
         if (!remote_mod_info.has_value()) {
             snapshot.denied_encrypted_source_paths.emplace_back(metadata->source_path);
             log_mod_gate_denial(metadata->source_path, "update_api_failed", metadata->update_url);
