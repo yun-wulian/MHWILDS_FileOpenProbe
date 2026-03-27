@@ -64,6 +64,7 @@ inline constexpr uint32_t kDefaultUpdateCacheTtlMinutes = 30;
 inline constexpr char kLoaderBuildVersion[] = MHWILDS_LOADER_VERSION;
 
 inline constexpr uintptr_t kOpenStreamRva = 0xBBC10;
+inline constexpr uintptr_t kReadStreamRva = 0xC8FF0;
 inline constexpr std::array<uintptr_t, 2> kCreateFileCallsiteRvas{
     0xBBD6D,
     0xBBE74,
@@ -99,6 +100,8 @@ using MapViewOfFileFn = LPVOID(WINAPI*)(HANDLE, DWORD, DWORD, DWORD, SIZE_T);
 using CloseHandleFn = BOOL(WINAPI*)(HANDLE);
 using NtQueryInformationFileFn = NTSTATUS(NTAPI*)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, FILE_INFORMATION_CLASS);
 using DirectStorageOpenFn = int64_t(__fastcall*)(void* rcx, const void* rdx, void* r8, void* r9);
+using OpenFileOrResourceStreamFn = uint32_t(__fastcall*)(int64_t* stream, const wchar_t* path, int open_mode, uint64_t flags);
+using ReadFileOrResourceStreamFn = uint64_t(__fastcall*)(uint64_t* stream, void* out_buffer, uint64_t bytes_to_read);
 
 enum class HwBreakpointType : uint8_t {
     Execute = 0,
@@ -152,6 +155,8 @@ struct VirtualPakHandleState {
     std::wstring requested_path{};
     std::wstring source_path{};
     std::shared_ptr<std::vector<uint8_t>> payload{};
+    std::shared_ptr<const struct VirtualPakSliceContext> slice_context{};
+    uint64_t plain_size{};
     uint64_t position{};
     bool synthetic_handle{true};
 };
@@ -255,6 +260,8 @@ extern MapViewOfFileFn g_original_map_view_of_file;
 extern CloseHandleFn g_original_close_handle;
 extern NtQueryInformationFileFn g_original_nt_query_information_file;
 extern DirectStorageOpenFn g_original_directstorage_open;
+extern OpenFileOrResourceStreamFn g_original_open_file_or_resource_stream;
+extern ReadFileOrResourceStreamFn g_original_read_file_or_resource_stream;
 
 extern std::mutex g_log_mutex;
 extern std::ofstream g_log;
@@ -268,6 +275,8 @@ extern std::atomic<uint64_t> g_sequence;
 extern std::atomic<bool> g_retry_registered;
 extern std::atomic<bool> g_create_file_hook_installed;
 extern std::atomic<bool> g_directstorage_hook_installed;
+extern std::atomic<bool> g_native_open_stream_hook_installed;
+extern std::atomic<bool> g_native_read_stream_hook_installed;
 extern std::atomic<bool> g_directstorage_retry_consumed;
 extern std::atomic<bool> g_early_bootstrap_attempted;
 extern std::atomic<bool> g_shutdown_requested;
@@ -287,6 +296,8 @@ extern std::atomic<uint64_t> g_map_view_of_file_hits;
 extern std::atomic<uint64_t> g_close_handle_hits;
 extern std::atomic<uint64_t> g_nt_query_info_hits;
 extern std::atomic<uint64_t> g_directstorage_hits;
+extern std::atomic<uint64_t> g_native_open_stream_hits;
+extern std::atomic<uint64_t> g_native_read_stream_hits;
 extern std::atomic<uint64_t> g_redirect_createfile_breakpoint_hits;
 extern std::atomic<bool> g_same_point_hooks_installed;
 extern std::atomic<bool> g_encrypted_mod_stage_prepared;
@@ -306,6 +317,8 @@ extern void* g_map_view_of_file_target;
 extern void* g_close_handle_target;
 extern void* g_nt_query_information_file_target;
 extern void* g_directstorage_target;
+extern void* g_open_file_or_resource_stream_target;
+extern void* g_read_file_or_resource_stream_target;
 extern uintptr_t g_directstorage_global_ptr_addr;
 
 extern std::array<uintptr_t, kCreateFileCallsiteRvas.size()> g_create_file_callsite_addrs;
@@ -448,6 +461,12 @@ void cleanup_staged_runtime_source();
 bool path_matches_virtual_target_locked(const std::wstring& normalized_path, const VirtualPakLoaderConfig& config);
 bool path_matches_record_target_locked(const std::wstring& normalized_path, const VirtualPakLoaderConfig& config);
 std::optional<ModMetadataRecord> load_mod_metadata_record(const std::filesystem::path& source_path);
+std::optional<VirtualPakHandleState> prepare_virtual_pak_handle_state(const VirtualPakLoaderConfig& config);
+std::optional<std::vector<uint8_t>> read_virtual_pak_bytes(
+    const VirtualPakHandleState& state,
+    uint64_t plain_offset,
+    size_t bytes_to_read,
+    DWORD* last_error = nullptr);
 
 bool path_matches_virtual_target(const std::wstring& path);
 bool path_matches_virtual_target(LPCWSTR file_name);
@@ -455,11 +474,7 @@ bool path_matches_record_target(const std::wstring& path);
 bool path_matches_record_target(LPCWSTR file_name);
 std::optional<VirtualPakLoaderConfig> current_virtual_loader_config();
 std::optional<std::wstring> current_virtual_source_path();
-HANDLE create_virtual_file_handle(
-    const std::wstring& requested_path,
-    const std::wstring& source_path,
-    std::shared_ptr<std::vector<uint8_t>> payload,
-    HANDLE backing_handle = nullptr);
+HANDLE create_virtual_file_handle(VirtualPakHandleState state, HANDLE backing_handle = nullptr);
 HANDLE create_virtual_mapping_handle(
     const std::wstring& path,
     std::shared_ptr<std::vector<uint8_t>> payload,
@@ -526,6 +541,7 @@ NTSTATUS patch_virtual_nt_query_information_file(
 
 bool install_same_point_reframework_chain_hooks();
 void uninstall_same_point_reframework_chain_hooks();
+bool install_native_stream_probe_hooks();
 bool install_create_file_hook();
 bool install_pak_io_hooks();
 bool install_directstorage_hook();

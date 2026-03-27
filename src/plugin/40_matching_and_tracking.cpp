@@ -45,11 +45,7 @@ std::optional<std::wstring> current_virtual_source_path() {
     return ensure_runtime_source_path_prepared();
 }
 
-HANDLE create_virtual_file_handle(
-    const std::wstring& requested_path,
-    const std::wstring& source_path,
-    std::shared_ptr<std::vector<uint8_t>> payload,
-    HANDLE backing_handle) {
+HANDLE create_virtual_file_handle(VirtualPakHandleState state, HANDLE backing_handle) {
     auto handle = backing_handle;
     const auto synthetic_handle = handle == nullptr || handle == INVALID_HANDLE_VALUE;
     if (synthetic_handle) {
@@ -58,12 +54,8 @@ HANDLE create_virtual_file_handle(
     }
 
     const auto key = reinterpret_cast<uintptr_t>(handle);
-    VirtualPakHandleState state{};
-    state.requested_path = requested_path;
-    state.source_path = source_path;
-    state.payload = std::move(payload);
-    state.position = 0;
     state.synthetic_handle = synthetic_handle;
+    state.position = 0;
 
     std::scoped_lock _{g_handle_mutex};
     g_virtual_pak_handles.emplace(key, std::move(state));
@@ -285,7 +277,7 @@ std::optional<uint64_t> lookup_pak_handle_size(HANDLE handle) {
     std::scoped_lock _{g_handle_mutex};
     const auto virtual_it = g_virtual_pak_handles.find(handle_key(handle));
     if (virtual_it != g_virtual_pak_handles.end()) {
-        return virtual_it->second.payload != nullptr ? virtual_it->second.payload->size() : 0ULL;
+        return virtual_it->second.plain_size;
     }
 
     const auto it = g_pak_handle_sizes.find(handle_key(handle));
@@ -426,6 +418,7 @@ void initialize_fixed_addresses() {
     oss << "fixed-targets"
         << " module_base=0x" << std::hex << g_game_module_base
         << " open_stream=0x" << (g_game_module_base + kOpenStreamRva)
+        << " read_stream=0x" << (g_game_module_base + kReadStreamRva)
         << " createfile_callsite_0=0x" << g_create_file_callsite_addrs[0]
         << " callsite_0_bytes=" << dump_bytes(reinterpret_cast<const void*>(g_create_file_callsite_addrs[0]), 8)
         << " createfile_callsite_1=0x" << g_create_file_callsite_addrs[1]
@@ -587,6 +580,10 @@ std::optional<std::shared_ptr<std::vector<uint8_t>>> lookup_virtual_payload(HAND
     std::scoped_lock _{g_handle_mutex};
     const auto it = g_virtual_pak_handles.find(handle_key(handle));
     if (it == g_virtual_pak_handles.end()) {
+        return std::nullopt;
+    }
+
+    if (it->second.payload == nullptr) {
         return std::nullopt;
     }
 

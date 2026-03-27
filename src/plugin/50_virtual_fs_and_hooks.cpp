@@ -2,6 +2,172 @@
 
 namespace mhwilds::probe {
 
+namespace {
+
+constexpr size_t kNativeStreamSnapshotBytes = 0x80;
+constexpr size_t kNativeStreamPreviewBytes = 0x20;
+constexpr uint64_t kNativeOpenStreamLogLimit = 64;
+constexpr uint64_t kNativeReadStreamLogLimit = 512;
+
+std::mutex g_native_stream_probe_mutex{};
+std::unordered_map<uintptr_t, std::wstring> g_native_stream_probe_paths{};
+std::unordered_map<uintptr_t, uint64_t> g_native_stream_probe_read_counts{};
+
+bool should_probe_native_stream_path(const wchar_t* path) {
+    return path != nullptr && path_looks_like_pak(path);
+}
+
+void remember_native_stream_path(const void* stream, const wchar_t* path) {
+    if (stream == nullptr || path == nullptr) {
+        return;
+    }
+
+    std::scoped_lock _{g_native_stream_probe_mutex};
+    g_native_stream_probe_paths[reinterpret_cast<uintptr_t>(stream)] = path;
+    g_native_stream_probe_read_counts[reinterpret_cast<uintptr_t>(stream)] = 0;
+}
+
+void forget_native_stream_path(const void* stream) {
+    if (stream == nullptr) {
+        return;
+    }
+
+    std::scoped_lock _{g_native_stream_probe_mutex};
+    const auto key = reinterpret_cast<uintptr_t>(stream);
+    g_native_stream_probe_paths.erase(key);
+    g_native_stream_probe_read_counts.erase(key);
+}
+
+std::optional<std::wstring> lookup_native_stream_path(const void* stream) {
+    if (stream == nullptr) {
+        return std::nullopt;
+    }
+
+    std::scoped_lock _{g_native_stream_probe_mutex};
+    const auto it = g_native_stream_probe_paths.find(reinterpret_cast<uintptr_t>(stream));
+    if (it == g_native_stream_probe_paths.end()) {
+        return std::nullopt;
+    }
+
+    return it->second;
+}
+
+uint64_t next_native_stream_read_count(const void* stream) {
+    if (stream == nullptr) {
+        return 0;
+    }
+
+    std::scoped_lock _{g_native_stream_probe_mutex};
+    auto& count = g_native_stream_probe_read_counts[reinterpret_cast<uintptr_t>(stream)];
+    count += 1;
+    return count;
+}
+
+std::string dump_native_stream_snapshot(const void* stream) {
+    if (stream == nullptr) {
+        return "<null>";
+    }
+
+    return dump_bytes(stream, kNativeStreamSnapshotBytes);
+}
+
+std::string dump_native_stream_preview(const void* buffer, uint64_t transferred) {
+    if (buffer == nullptr || transferred == 0) {
+        return "<none>";
+    }
+
+    const auto preview_count = static_cast<size_t>(transferred > kNativeStreamPreviewBytes ? kNativeStreamPreviewBytes : transferred);
+    return dump_bytes(buffer, preview_count);
+}
+
+bool native_stream_open_succeeded(uint32_t result) {
+    return result == 0;
+}
+
+} // namespace
+
+uint32_t __fastcall hooked_open_file_or_resource_stream(
+    int64_t* stream,
+    const wchar_t* path,
+    int open_mode,
+    uint64_t flags) {
+    const auto caller = reinterpret_cast<void*>(_ReturnAddress());
+    const auto should_probe = should_probe_native_stream_path(path);
+    const auto before_snapshot = should_probe ? dump_native_stream_snapshot(stream) : std::string{};
+
+    forget_native_stream_path(stream);
+
+    const auto result = g_original_open_file_or_resource_stream(stream, path, open_mode, flags);
+    const auto open_ok = native_stream_open_succeeded(result);
+    if (should_probe && open_ok) {
+        remember_native_stream_path(stream, path);
+    }
+
+    if (should_probe) {
+        const auto hit = g_native_open_stream_hits.fetch_add(1) + 1;
+        if (hit <= kNativeOpenStreamLogLimit || (path != nullptr && path_matches_focus_target(path))) {
+            std::ostringstream oss;
+            oss << "[native-open " << hit << "]"
+                << describe_caller(caller)
+                << std::hex
+                << " stream=0x" << reinterpret_cast<uintptr_t>(stream)
+                << " mode=0x" << static_cast<uint32_t>(open_mode)
+                << " flags=0x" << flags
+                << " result=0x" << result
+                << std::dec
+                << " tracked=" << static_cast<int>(open_ok)
+                << "\n"
+                << "path=" << (path != nullptr ? narrow_utf8(std::wstring{path}) : "<null>")
+                << "\n"
+                << "stream_before=" << before_snapshot
+                << "\n"
+                << "stream_after=" << dump_native_stream_snapshot(stream)
+                << "\n\n";
+            append_log_line(oss.str());
+        }
+    }
+
+    return result;
+}
+
+uint64_t __fastcall hooked_read_file_or_resource_stream(
+    uint64_t* stream,
+    void* out_buffer,
+    uint64_t bytes_to_read) {
+    const auto tracked_path = lookup_native_stream_path(stream);
+    const auto caller = reinterpret_cast<void*>(_ReturnAddress());
+    const auto before_snapshot = tracked_path.has_value() ? dump_native_stream_snapshot(stream) : std::string{};
+
+    const auto result = g_original_read_file_or_resource_stream(stream, out_buffer, bytes_to_read);
+
+    if (tracked_path.has_value()) {
+        const auto global_hit = g_native_read_stream_hits.fetch_add(1) + 1;
+        const auto stream_hit = next_native_stream_read_count(stream);
+        if (global_hit <= kNativeReadStreamLogLimit || path_matches_focus_target(*tracked_path)) {
+            std::ostringstream oss;
+            oss << "[native-read " << global_hit << "]"
+                << describe_caller(caller)
+                << std::hex
+                << " stream=0x" << reinterpret_cast<uintptr_t>(stream)
+                << " stream_hit=0x" << stream_hit
+                << " requested=0x" << bytes_to_read
+                << " returned=0x" << result
+                << "\n"
+                << "path=" << narrow_utf8(*tracked_path)
+                << "\n"
+                << "stream_before=" << before_snapshot
+                << "\n"
+                << "stream_after=" << dump_native_stream_snapshot(stream)
+                << "\n"
+                << "buffer=" << dump_native_stream_preview(out_buffer, result)
+                << "\n\n";
+            append_log_line(oss.str());
+        }
+    }
+
+    return result;
+}
+
 std::optional<HANDLE> try_open_virtual_pak(
     LPCWSTR file_name,
     DWORD desired_access,
@@ -49,8 +215,8 @@ std::optional<HANDLE> try_open_virtual_pak(
         return result;
     }
 
-    const auto payload = load_virtual_pak_payload();
-    if (!payload.has_value()) {
+    const auto prepared_state = prepare_virtual_pak_handle_state(*config);
+    if (!prepared_state.has_value()) {
         if (last_error != nullptr) {
             *last_error = ERROR_INVALID_DATA;
         }
@@ -83,7 +249,9 @@ std::optional<HANDLE> try_open_virtual_pak(
             << " path=" << narrow_utf8(file_name)
             << "\n";
         append_log_line(oss.str());
-        return create_virtual_file_handle(file_name, config->source_path, *payload, backing_handle);
+        auto state = *prepared_state;
+        state.requested_path = file_name;
+        return create_virtual_file_handle(std::move(state), backing_handle);
     }
 
     {
@@ -97,7 +265,9 @@ std::optional<HANDLE> try_open_virtual_pak(
         append_log_line(oss.str());
     }
 
-    return create_virtual_file_handle(file_name, config->source_path, *payload);
+    auto state = *prepared_state;
+    state.requested_path = file_name;
+    return create_virtual_file_handle(std::move(state));
 }
 
 HANDLE WINAPI hooked_create_file_w(
@@ -152,7 +322,7 @@ HANDLE WINAPI hooked_create_file_w(
                     &last_error);
                 virtual_result.has_value()) {
                 result = *virtual_result;
-                is_virtual_pak = result != INVALID_HANDLE_VALUE && lookup_virtual_payload(result).has_value();
+                is_virtual_pak = result != INVALID_HANDLE_VALUE && lookup_virtual_pak_state(result).has_value();
             } else {
                 result = g_original_create_file_w(
                     file_name,
@@ -257,52 +427,56 @@ BOOL WINAPI hooked_read_file(
     const auto tracked_path = lookup_pak_handle_path(file);
     const auto position_before = tracked_path.has_value() ? lookup_pak_handle_position(file) : std::nullopt;
     const auto caller = reinterpret_cast<void*>(_ReturnAddress());
-    const auto virtual_payload = tracked_path.has_value() ? lookup_virtual_payload(file) : std::nullopt;
     const auto virtual_state = tracked_path.has_value() ? lookup_virtual_pak_state(file) : std::nullopt;
+    const auto is_virtual = virtual_state.has_value();
 
     BOOL result{};
     DWORD last_error = ERROR_SUCCESS;
+    DWORD transferred = 0;
 
-    if (virtual_payload.has_value()) {
-        const auto payload = *virtual_payload;
+    if (is_virtual) {
         uint64_t read_offset = position_before.value_or(0);
         if (overlapped != nullptr) {
             read_offset = (static_cast<uint64_t>(overlapped->OffsetHigh) << 32) | overlapped->Offset;
         }
 
-        auto transferred = 0U;
-        if (read_offset < payload->size()) {
-            const auto remaining = payload->size() - static_cast<size_t>(read_offset);
-            transferred = static_cast<DWORD>(std::min<size_t>(remaining, bytes_to_read));
-            if (transferred != 0 && buffer != nullptr) {
-                std::memcpy(buffer, payload->data() + read_offset, transferred);
+        const auto read_bytes = read_virtual_pak_bytes(*virtual_state, read_offset, bytes_to_read, &last_error);
+        if (!read_bytes.has_value()) {
+            if (bytes_read != nullptr) {
+                *bytes_read = 0;
             }
-        }
+            result = FALSE;
+        } else {
+            transferred = static_cast<DWORD>(read_bytes->size());
+            if (transferred != 0 && buffer != nullptr) {
+                std::memcpy(buffer, read_bytes->data(), transferred);
+            }
 
-        if (bytes_read != nullptr) {
-            *bytes_read = transferred;
-        }
+            if (bytes_read != nullptr) {
+                *bytes_read = transferred;
+            }
 
-        if (overlapped == nullptr) {
-            set_pak_handle_position(file, read_offset + transferred);
-            if (virtual_state.has_value() && !virtual_state->synthetic_handle) {
-                LARGE_INTEGER sync_offset{};
-                sync_offset.QuadPart = static_cast<LONGLONG>(read_offset + transferred);
-                if (g_original_set_file_pointer_ex(file, sync_offset, nullptr, FILE_BEGIN) == 0) {
-                    last_error = GetLastError();
+            if (overlapped == nullptr) {
+                set_pak_handle_position(file, read_offset + transferred);
+                if (!virtual_state->synthetic_handle) {
+                    LARGE_INTEGER sync_offset{};
+                    sync_offset.QuadPart = static_cast<LONGLONG>(read_offset + transferred);
+                    if (g_original_set_file_pointer_ex(file, sync_offset, nullptr, FILE_BEGIN) == 0) {
+                        last_error = GetLastError();
+                    }
                 }
             }
-        }
 
-        result = TRUE;
+            result = TRUE;
+        }
     } else {
         result = g_original_read_file(file, buffer, bytes_to_read, bytes_read, overlapped);
         last_error = result == 0 ? GetLastError() : ERROR_SUCCESS;
+        transferred = bytes_read != nullptr ? *bytes_read : 0;
     }
 
     if (tracked_path.has_value()) {
         const auto hit = g_read_file_hits.fetch_add(1) + 1;
-        const auto transferred = bytes_read != nullptr ? *bytes_read : 0;
         std::optional<uint64_t> position_after = position_before;
 
         if (result != 0 && overlapped == nullptr && position_before.has_value()) {
@@ -321,7 +495,7 @@ BOOL WINAPI hooked_read_file(
                 << " requested=0x" << bytes_to_read
                 << " transferred=0x" << transferred
                 << " overlapped=0x" << reinterpret_cast<uintptr_t>(overlapped)
-                << " virtual=" << std::dec << static_cast<int>(virtual_payload.has_value())
+                << " virtual=" << std::dec << static_cast<int>(is_virtual)
                 << std::hex
                 << " result=" << std::dec << static_cast<int>(result)
                 << " last_error=" << last_error
@@ -340,7 +514,7 @@ BOOL WINAPI hooked_read_file(
         }
     }
 
-    if (virtual_payload.has_value()) {
+    if (is_virtual) {
         SetLastError(last_error);
     }
 
@@ -474,14 +648,16 @@ BOOL WINAPI hooked_set_file_pointer_ex(
 BOOL WINAPI hooked_get_file_size_ex(HANDLE file, PLARGE_INTEGER file_size) {
     const auto tracked_path = lookup_pak_handle_path(file);
     const auto caller = reinterpret_cast<void*>(_ReturnAddress());
-    const auto virtual_payload = tracked_path.has_value() ? lookup_virtual_payload(file) : std::nullopt;
+    const auto virtual_state = tracked_path.has_value() ? lookup_virtual_pak_state(file) : std::nullopt;
+    const auto is_virtual = virtual_state.has_value();
+    const auto virtual_size = tracked_path.has_value() ? lookup_pak_handle_size(file) : std::nullopt;
 
     BOOL result{};
     DWORD last_error = ERROR_SUCCESS;
 
-    if (virtual_payload.has_value()) {
+    if (is_virtual) {
         if (file_size != nullptr) {
-            file_size->QuadPart = static_cast<LONGLONG>((*virtual_payload)->size());
+            file_size->QuadPart = static_cast<LONGLONG>(virtual_size.value_or(0));
         }
         result = TRUE;
     } else {
@@ -503,7 +679,7 @@ BOOL WINAPI hooked_get_file_size_ex(HANDLE file, PLARGE_INTEGER file_size) {
                 << std::hex
                 << " handle=0x" << handle_key(file)
                 << " size=0x" << size
-                << " virtual=" << std::dec << static_cast<int>(virtual_payload.has_value())
+                << " virtual=" << std::dec << static_cast<int>(is_virtual)
                 << std::hex
                 << " result=" << std::dec << static_cast<int>(result)
                 << " last_error=" << last_error
@@ -514,7 +690,7 @@ BOOL WINAPI hooked_get_file_size_ex(HANDLE file, PLARGE_INTEGER file_size) {
         }
     }
 
-    if (virtual_payload.has_value()) {
+    if (is_virtual) {
         SetLastError(last_error);
     }
 
@@ -789,6 +965,7 @@ HANDLE WINAPI hooked_create_file_mapping_w(
     const auto caller = reinterpret_cast<void*>(_ReturnAddress());
     const auto virtual_payload = tracked_path.has_value() ? lookup_virtual_payload(file) : std::nullopt;
     const auto virtual_state = tracked_path.has_value() ? lookup_virtual_pak_state(file) : std::nullopt;
+    const auto is_virtual = virtual_state.has_value();
 
     HANDLE result{};
     DWORD last_error = ERROR_SUCCESS;
@@ -811,6 +988,9 @@ HANDLE WINAPI hooked_create_file_mapping_w(
         } else {
             result = create_virtual_mapping_handle(*tracked_path, *virtual_payload);
         }
+    } else if (is_virtual) {
+        last_error = ERROR_NOT_SUPPORTED;
+        result = nullptr;
     } else {
         result = g_original_create_file_mapping_w(
             file,
@@ -823,7 +1003,7 @@ HANDLE WINAPI hooked_create_file_mapping_w(
     }
 
     if (tracked_path.has_value()) {
-        if (result != nullptr && !virtual_payload.has_value()) {
+        if (result != nullptr && !is_virtual) {
             track_mapping_handle(result, *tracked_path);
         }
 
@@ -838,7 +1018,7 @@ HANDLE WINAPI hooked_create_file_mapping_w(
                 << " protect=0x" << protect
                 << " max_high=0x" << maximum_size_high
                 << " max_low=0x" << maximum_size_low
-                << " virtual=" << std::dec << static_cast<int>(virtual_payload.has_value())
+                << " virtual=" << std::dec << static_cast<int>(is_virtual)
                 << std::hex
                 << " result=" << std::dec << (result != nullptr ? 1 : 0)
                 << " last_error=" << last_error
@@ -849,7 +1029,7 @@ HANDLE WINAPI hooked_create_file_mapping_w(
         }
     }
 
-    if (virtual_payload.has_value()) {
+    if (is_virtual) {
         SetLastError(last_error);
     }
 
@@ -1096,6 +1276,60 @@ int64_t __fastcall hooked_directstorage_open(void* rcx, const void* rdx, void* r
     }
 
     return result;
+}
+
+bool install_native_stream_probe_hooks() {
+    if (g_native_open_stream_hook_installed.load() && g_native_read_stream_hook_installed.load()) {
+        return true;
+    }
+
+    if (!ensure_minhook_initialized()) {
+        return false;
+    }
+
+    initialize_fixed_addresses();
+    if (g_game_module_base == 0) {
+        append_log_line("native-stream-hook-module-base-missing\n");
+        return false;
+    }
+
+    if (g_open_file_or_resource_stream_target == nullptr) {
+        g_open_file_or_resource_stream_target = reinterpret_cast<void*>(g_game_module_base + kOpenStreamRva);
+    }
+    if (g_read_file_or_resource_stream_target == nullptr) {
+        g_read_file_or_resource_stream_target = reinterpret_cast<void*>(g_game_module_base + kReadStreamRva);
+    }
+
+    const auto open_ok = install_named_hook(
+        g_open_file_or_resource_stream_target,
+        reinterpret_cast<void*>(&hooked_open_file_or_resource_stream),
+        reinterpret_cast<void**>(&g_original_open_file_or_resource_stream),
+        "OpenFileOrResourceStream");
+    if (open_ok) {
+        g_native_open_stream_hook_installed = true;
+        append_log_line("hook-installed target=OpenFileOrResourceStream\n");
+    }
+
+    const auto read_ok = install_named_hook(
+        g_read_file_or_resource_stream_target,
+        reinterpret_cast<void*>(&hooked_read_file_or_resource_stream),
+        reinterpret_cast<void**>(&g_original_read_file_or_resource_stream),
+        "ReadFileOrResourceStream");
+    if (read_ok) {
+        g_native_read_stream_hook_installed = true;
+        append_log_line("hook-installed target=ReadFileOrResourceStream\n");
+    }
+
+    std::ostringstream oss;
+    oss << "native-stream-hooks"
+        << " open=" << static_cast<int>(open_ok)
+        << " read=" << static_cast<int>(read_ok)
+        << " open_target=0x" << std::hex << reinterpret_cast<uintptr_t>(g_open_file_or_resource_stream_target)
+        << " read_target=0x" << reinterpret_cast<uintptr_t>(g_read_file_or_resource_stream_target)
+        << "\n";
+    append_log_line(oss.str());
+
+    return open_ok && read_ok;
 }
 
 bool install_create_file_hook() {

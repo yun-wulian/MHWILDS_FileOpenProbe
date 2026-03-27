@@ -15,6 +15,8 @@ void log_install_result(const char* source, bool create_file_ok, bool directstor
         << " pak_io=" << static_cast<int>(pak_io_ok)
         << " directstorage=" << static_cast<int>(directstorage_ok)
         << " hw_trace=" << static_cast<int>(trace_ok)
+        << " native_open=" << static_cast<int>(g_native_open_stream_hook_installed.load())
+        << " native_read=" << static_cast<int>(g_native_read_stream_hook_installed.load())
 #if defined(MHWILDS_VERSION_PROXY)
         << " patch_break=" << static_cast<int>(g_patch_version_breakpoint_addr != 0)
         << " same_point=" << static_cast<int>(g_same_point_hooks_installed.load())
@@ -46,6 +48,11 @@ void run_probe_installation(const char* source, bool directstorage_retry_loop) {
         config = g_virtual_loader_config;
     }
 
+    const auto native_stream_ok = install_native_stream_probe_hooks();
+    if (!native_stream_ok) {
+        append_log_line("native-stream-probe-install-failed\n");
+    }
+
 #if defined(MHWILDS_VERSION_PROXY)
     const auto trace_ok = install_hw_instruction_trace(config);
 #else
@@ -64,6 +71,7 @@ void run_probe_installation(const char* source, bool directstorage_retry_loop) {
 #else
         constexpr bool same_point_ok = false;
 #endif
+        (void)same_point_ok;
         append_log_line("rf-chain-mode active; skipping legacy minhook backend\n");
         log_install_result(source, false, same_point_ok, false, trace_ok);
         return;
@@ -127,9 +135,6 @@ void run_probe_installation(const char* source, bool directstorage_retry_loop) {
 
 DWORD WINAPI attach_probe_thread(LPVOID) {
     run_probe_installation("attach-init-result", true);
-#if defined(MHWILDS_VERSION_PROXY)
-    run_hw_trace_reapply_loop();
-#endif
     return 0;
 }
 
@@ -149,6 +154,11 @@ void run_early_create_file_bootstrap() {
     {
         std::scoped_lock __{g_virtual_loader_mutex};
         config = g_virtual_loader_config;
+    }
+
+    const auto native_stream_ok = install_native_stream_probe_hooks();
+    if (!native_stream_ok) {
+        append_log_line("native-stream-probe-install-failed-early\n");
     }
 
 #if defined(MHWILDS_VERSION_PROXY)
@@ -294,9 +304,21 @@ void shutdown_hooks() {
         MH_RemoveHook(g_directstorage_target);
     }
 
+    if (g_open_file_or_resource_stream_target != nullptr) {
+        MH_DisableHook(g_open_file_or_resource_stream_target);
+        MH_RemoveHook(g_open_file_or_resource_stream_target);
+    }
+
+    if (g_read_file_or_resource_stream_target != nullptr) {
+        MH_DisableHook(g_read_file_or_resource_stream_target);
+        MH_RemoveHook(g_read_file_or_resource_stream_target);
+    }
+
     MH_Uninitialize();
     g_create_file_hook_installed = false;
     g_directstorage_hook_installed = false;
+    g_native_open_stream_hook_installed = false;
+    g_native_read_stream_hook_installed = false;
 
     std::scoped_lock _{g_handle_mutex};
     g_pak_handle_paths.clear();

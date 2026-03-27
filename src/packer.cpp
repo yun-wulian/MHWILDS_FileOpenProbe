@@ -348,6 +348,85 @@ std::optional<DerivedKeyMaterial> derive_v2_key_material(const std::filesystem::
     return derive_v2_key_material(*game_fingerprint, purpose);
 }
 
+uint64_t ceil_div_u64(uint64_t value, uint64_t divisor) {
+    return divisor == 0 ? 0 : ((value + divisor - 1) / divisor);
+}
+
+uint64_t align_up_u64(uint64_t value, uint64_t alignment) {
+    return alignment == 0 ? value : ceil_div_u64(value, alignment) * alignment;
+}
+
+void write_header_reserved_u32(encrypted_pak::HeaderV2& header, uint32_t index, uint32_t value) {
+    if ((static_cast<size_t>(index) + 1) * sizeof(uint32_t) > sizeof(header.reserved)) {
+        return;
+    }
+
+    std::memcpy(header.reserved + (static_cast<size_t>(index) * sizeof(uint32_t)), &value, sizeof(value));
+}
+
+uint64_t compute_chunk_count(uint64_t plain_size, uint32_t chunk_plain_size) {
+    return chunk_plain_size == 0 ? 0 : ceil_div_u64(plain_size, chunk_plain_size);
+}
+
+uint64_t compute_chunk_plain_size(uint64_t plain_size, uint32_t chunk_plain_size, uint64_t chunk_index) {
+    const auto chunk_start = chunk_index * static_cast<uint64_t>(chunk_plain_size);
+    if (chunk_start >= plain_size) {
+        return 0;
+    }
+
+    const auto remaining = plain_size - chunk_start;
+    return remaining < chunk_plain_size ? remaining : chunk_plain_size;
+}
+
+uint64_t compute_chunk_cipher_size(uint64_t chunk_plain_size) {
+    if (chunk_plain_size == 0) {
+        return 0;
+    }
+
+    return align_up_u64(chunk_plain_size, 16);
+}
+
+uint64_t compute_total_chunk_cipher_size(uint64_t plain_size, uint32_t chunk_plain_size) {
+    const auto chunk_count = compute_chunk_count(plain_size, chunk_plain_size);
+    uint64_t total = 0;
+    for (uint64_t chunk_index = 0; chunk_index < chunk_count; ++chunk_index) {
+        total += compute_chunk_cipher_size(compute_chunk_plain_size(plain_size, chunk_plain_size, chunk_index));
+    }
+
+    return total;
+}
+
+std::array<uint8_t, 16> derive_chunk_iv(const uint8_t* base_iv, uint64_t chunk_index) {
+    std::array<uint8_t, 16> iv{};
+    std::memcpy(iv.data(), base_iv, iv.size());
+
+    auto carry = chunk_index;
+    for (size_t offset = 0; offset < sizeof(uint64_t); ++offset) {
+        const auto byte_index = iv.size() - 1 - offset;
+        const auto sum = static_cast<uint32_t>(iv[byte_index]) + static_cast<uint32_t>(carry & 0xFF);
+        iv[byte_index] = static_cast<uint8_t>(sum & 0xFF);
+        carry = (carry >> 8) + (sum >> 8);
+    }
+
+    return iv;
+}
+
+std::optional<std::array<uint8_t, 32>> compute_chunked_container_auth_tag(
+    const encrypted_pak::HeaderV2& header,
+    const std::vector<uint8_t>& auth_table,
+    const std::array<uint8_t, 32>& authentication_key) {
+    encrypted_pak::HeaderV2 header_copy = header;
+    std::memset(header_copy.auth_tag, 0, sizeof(header_copy.auth_tag));
+
+    std::vector<uint8_t> auth_input(sizeof(header_copy) + auth_table.size(), 0);
+    std::memcpy(auth_input.data(), &header_copy, sizeof(header_copy));
+    if (!auth_table.empty()) {
+        std::memcpy(auth_input.data() + sizeof(header_copy), auth_table.data(), auth_table.size());
+    }
+
+    return compute_hmac_sha256_bytes(auth_input.data(), auth_input.size(), authentication_key);
+}
+
 std::optional<std::vector<uint8_t>> encrypt_v2_payload_bytes(
     const std::vector<uint8_t>& plain_bytes,
     const std::array<uint8_t, 16>& game_fingerprint,
@@ -454,6 +533,17 @@ bool encrypt_pak_to_v2_container(
         return false;
     }
 
+    std::error_code size_ec{};
+    const auto source_size_raw = std::filesystem::file_size(input_pak, size_ec);
+    if (size_ec || source_size_raw == 0) {
+        return false;
+    }
+
+    const auto plain_size = static_cast<uint64_t>(source_size_raw);
+    const auto chunk_plain_size = encrypted_pak::kDefaultPakChunkPlainSize;
+    const auto chunk_count = compute_chunk_count(plain_size, chunk_plain_size);
+    const auto auth_table_size_u64 = chunk_count * static_cast<uint64_t>(encrypted_pak::kChunkAuthTagSize);
+
     encrypted_pak::HeaderV2 header{};
     std::vector<uint8_t> metadata_block{};
     if (const auto plain_metadata_block = build_plain_metadata_block(metadata); !plain_metadata_block.has_value()) {
@@ -470,12 +560,27 @@ bool encrypt_pak_to_v2_container(
         metadata_block = std::move(*encrypted_metadata_block);
     }
 
+    const auto header_size_u64 = static_cast<uint64_t>(sizeof(encrypted_pak::HeaderV2)) +
+        static_cast<uint64_t>(metadata_block.size()) +
+        auth_table_size_u64;
+    if (header_size_u64 > 0xFFFFFFFFULL) {
+        return false;
+    }
+
+    std::vector<uint8_t> auth_table(static_cast<size_t>(auth_table_size_u64), 0);
+
     std::memcpy(header.magic, encrypted_pak::kMagic.data(), encrypted_pak::kMagic.size());
     header.version = encrypted_pak::kVersion;
-    header.header_size = static_cast<uint32_t>(sizeof(encrypted_pak::HeaderV2) + metadata_block.size());
-    header.algorithm = encrypted_pak::kAlgorithmAes256CbcHmacSha256;
+    header.header_size = static_cast<uint32_t>(header_size_u64);
+    header.algorithm = encrypted_pak::kAlgorithmAes256CbcChunkedHmacSha256;
     header.purpose = encrypted_pak::kPurposePak;
+    header.plain_size = plain_size;
+    header.cipher_size = compute_total_chunk_cipher_size(plain_size, chunk_plain_size);
     std::memcpy(header.game_fingerprint, key_material.game_fingerprint.data(), key_material.game_fingerprint.size());
+    write_header_reserved_u32(header, encrypted_pak::kHeaderReservedFlagsIndex, encrypted_pak::kHeaderReservedFlagChunkedLayout);
+    write_header_reserved_u32(header, encrypted_pak::kHeaderReservedMetadataSizeIndex, static_cast<uint32_t>(metadata_block.size()));
+    write_header_reserved_u32(header, encrypted_pak::kHeaderReservedChunkPlainSizeIndex, chunk_plain_size);
+    write_header_reserved_u32(header, encrypted_pak::kHeaderReservedChunkAuthSizeIndex, encrypted_pak::kChunkAuthTagSize);
 
     if (BCryptGenRandom(nullptr, header.iv, sizeof(header.iv), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
         return false;
@@ -493,22 +598,20 @@ bool encrypt_pak_to_v2_container(
         }
     }
 
+    if (!auth_table.empty()) {
+        output.write(reinterpret_cast<const char*>(auth_table.data()), static_cast<std::streamsize>(auth_table.size()));
+        if (!output.good()) {
+            return false;
+        }
+    }
+
     ScopedBcryptAlgorithmHandle aes_algorithm{};
     ScopedBcryptKeyHandle aes_key{};
-    ScopedBcryptAlgorithmHandle hmac_algorithm{};
-    ScopedBcryptHashHandle hmac_hash{};
     DWORD aes_object_size{};
     DWORD bytes_written{};
-    DWORD hmac_object_size{};
-    DWORD hmac_hash_size{};
     std::vector<uint8_t> aes_key_object{};
-    std::vector<uint8_t> hmac_hash_object{};
-    std::vector<uint8_t> read_buffer(encrypted_pak::kDefaultIoChunkSize, 0);
-    std::vector<uint8_t> pending{};
-    std::vector<uint8_t> cipher_buffer(encrypted_pak::kDefaultIoChunkSize + 32, 0);
-    std::array<uint8_t, 16> iv{};
-    uint64_t plain_size = 0;
-    uint64_t cipher_size = 0;
+    std::vector<uint8_t> read_buffer(chunk_plain_size, 0);
+    std::vector<uint8_t> cipher_buffer(static_cast<size_t>(chunk_plain_size) + 16U, 0);
 
     if (BCryptOpenAlgorithmProvider(&aes_algorithm.handle, BCRYPT_AES_ALGORITHM, nullptr, 0) != 0) {
         return false;
@@ -532,113 +635,63 @@ bool encrypt_pak_to_v2_container(
         return false;
     }
 
-    if (BCryptOpenAlgorithmProvider(&hmac_algorithm.handle, BCRYPT_SHA256_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG) != 0) {
-        return false;
-    }
-
-    if (BCryptGetProperty(hmac_algorithm.handle, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&hmac_object_size), sizeof(hmac_object_size), &bytes_written, 0) != 0 ||
-        BCryptGetProperty(hmac_algorithm.handle, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&hmac_hash_size), sizeof(hmac_hash_size), &bytes_written, 0) != 0 ||
-        hmac_hash_size != sizeof(header.auth_tag)) {
-        return false;
-    }
-
-    hmac_hash_object.resize(hmac_object_size);
-    if (BCryptCreateHash(
-            hmac_algorithm.handle,
-            &hmac_hash.handle,
-            hmac_hash_object.data(),
-            static_cast<ULONG>(hmac_hash_object.size()),
-            const_cast<PUCHAR>(key_material.authentication_key.data()),
-            static_cast<ULONG>(key_material.authentication_key.size()),
-            0) != 0) {
-        return false;
-    }
-
-    std::memcpy(iv.data(), header.iv, sizeof(iv));
-    pending.reserve(read_buffer.size() + sizeof(iv));
-
-    while (true) {
-        input.read(reinterpret_cast<char*>(read_buffer.data()), static_cast<std::streamsize>(read_buffer.size()));
-        const auto bytes_read = input.gcount();
-        if (bytes_read < 0) {
+    for (uint64_t chunk_index = 0; chunk_index < chunk_count; ++chunk_index) {
+        const auto current_chunk_plain_size = compute_chunk_plain_size(plain_size, chunk_plain_size, chunk_index);
+        if (current_chunk_plain_size == 0 || current_chunk_plain_size > read_buffer.size()) {
             return false;
         }
 
-        if (bytes_read > 0) {
-            pending.insert(pending.end(), read_buffer.begin(), read_buffer.begin() + bytes_read);
-        }
-
-        const auto is_final = input.eof();
-        size_t plain_to_process = 0;
-        if (is_final) {
-            plain_to_process = pending.size();
-        } else {
-            plain_to_process = pending.size() - (pending.size() % sizeof(iv));
-        }
-
-        if (plain_to_process == 0 && !is_final) {
-            if (!input.good()) {
-                return false;
-            }
-            continue;
-        }
-
-        if (cipher_buffer.size() < plain_to_process + sizeof(iv) + 16) {
-            cipher_buffer.resize(plain_to_process + sizeof(iv) + 16);
-        }
-
-        if (plain_to_process > 0 &&
-            BCryptHashData(hmac_hash.handle, pending.data(), static_cast<ULONG>(plain_to_process), 0) != 0) {
+        input.read(reinterpret_cast<char*>(read_buffer.data()), static_cast<std::streamsize>(current_chunk_plain_size));
+        if (input.gcount() != static_cast<std::streamsize>(current_chunk_plain_size)) {
             return false;
         }
 
+        const auto chunk_auth_tag = compute_hmac_sha256_bytes(
+            read_buffer.data(),
+            static_cast<size_t>(current_chunk_plain_size),
+            key_material.authentication_key);
+        if (!chunk_auth_tag.has_value()) {
+            return false;
+        }
+
+        const auto auth_table_offset = static_cast<size_t>(chunk_index * encrypted_pak::kChunkAuthTagSize);
+        std::memcpy(auth_table.data() + auth_table_offset, chunk_auth_tag->data(), chunk_auth_tag->size());
+
+        auto chunk_iv = derive_chunk_iv(header.iv, chunk_index);
+        const auto use_padding = (current_chunk_plain_size % 16) != 0;
         ULONG cipher_chunk_size{};
         const auto encrypt_status = BCryptEncrypt(
             aes_key.handle,
-            pending.data(),
-            static_cast<ULONG>(plain_to_process),
+            read_buffer.data(),
+            static_cast<ULONG>(current_chunk_plain_size),
             nullptr,
-            iv.data(),
-            static_cast<ULONG>(iv.size()),
+            chunk_iv.data(),
+            static_cast<ULONG>(chunk_iv.size()),
             cipher_buffer.data(),
             static_cast<ULONG>(cipher_buffer.size()),
             &cipher_chunk_size,
-            is_final ? BCRYPT_BLOCK_PADDING : 0);
+            use_padding ? BCRYPT_BLOCK_PADDING : 0);
 
-        if (encrypt_status != 0) {
+        if (encrypt_status != 0 ||
+            cipher_chunk_size != compute_chunk_cipher_size(current_chunk_plain_size)) {
             return false;
         }
 
-        if (cipher_chunk_size > 0) {
-            output.write(reinterpret_cast<const char*>(cipher_buffer.data()), cipher_chunk_size);
-            if (!output.good()) {
-                return false;
-            }
-        }
-
-        plain_size += plain_to_process;
-        cipher_size += cipher_chunk_size;
-        pending.erase(pending.begin(), pending.begin() + static_cast<std::ptrdiff_t>(plain_to_process));
-
-        if (is_final) {
-            break;
-        }
-
-        if (!input.good()) {
+        output.write(reinterpret_cast<const char*>(cipher_buffer.data()), cipher_chunk_size);
+        if (!output.good()) {
             return false;
         }
     }
 
-    if (!pending.empty()) {
+    if (input.peek() != std::char_traits<char>::eof()) {
         return false;
     }
 
-    if (BCryptFinishHash(hmac_hash.handle, header.auth_tag, sizeof(header.auth_tag), 0) != 0) {
+    const auto container_auth_tag = compute_chunked_container_auth_tag(header, auth_table, key_material.authentication_key);
+    if (!container_auth_tag.has_value()) {
         return false;
     }
-
-    header.plain_size = plain_size;
-    header.cipher_size = cipher_size;
+    std::memcpy(header.auth_tag, container_auth_tag->data(), container_auth_tag->size());
 
     output.flush();
     if (!output.good()) {
@@ -647,6 +700,14 @@ bool encrypt_pak_to_v2_container(
 
     output.seekp(0, std::ios::beg);
     output.write(reinterpret_cast<const char*>(&header), sizeof(header));
+    if (!output.good()) {
+        return false;
+    }
+
+    if (!auth_table.empty()) {
+        output.seekp(static_cast<std::streamoff>(sizeof(header) + metadata_block.size()), std::ios::beg);
+        output.write(reinterpret_cast<const char*>(auth_table.data()), static_cast<std::streamsize>(auth_table.size()));
+    }
     output.flush();
     return output.good();
 }
@@ -710,7 +771,7 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     std::wcout << L"Encrypted pak written to: " << output_path << L"\n";
-    std::wcout << L"Format: v2 AES-256-CBC + HMAC-SHA256\n";
+    std::wcout << L"Format: v2 chunked AES-256-CBC + per-chunk HMAC-SHA256\n";
     if (!metadata.empty()) {
         std::wcout << L"Metadata embedded: yes\n";
     }

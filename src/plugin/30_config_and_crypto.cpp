@@ -1111,6 +1111,452 @@ std::optional<std::vector<uint8_t>> decrypt_xor32(
     return output;
 }
 
+struct ChunkedPakLayout {
+    uint32_t metadata_container_size{};
+    uint32_t chunk_plain_size{};
+    uint32_t chunk_auth_tag_size{};
+    uint64_t chunk_count{};
+    uint64_t chunk_auth_table_offset{};
+    uint64_t chunk_auth_table_size{};
+    uint64_t payload_offset{};
+};
+
+struct VirtualPakSliceContext {
+    encrypted_pak::HeaderV2 header{};
+    DerivedKeyMaterial material{};
+    uint32_t metadata_container_size{};
+    uint32_t chunk_plain_size{};
+    uint32_t chunk_auth_tag_size{};
+    uint64_t chunk_count{};
+    uint64_t chunk_auth_table_offset{};
+    uint64_t chunk_auth_table_size{};
+    uint64_t payload_offset{};
+    std::vector<uint8_t> auth_table{};
+};
+
+uint64_t ceil_div_u64(uint64_t value, uint64_t divisor) {
+    return divisor == 0 ? 0 : ((value + divisor - 1) / divisor);
+}
+
+uint64_t align_up_u64(uint64_t value, uint64_t alignment) {
+    return alignment == 0 ? value : ceil_div_u64(value, alignment) * alignment;
+}
+
+uint32_t read_header_reserved_u32(const encrypted_pak::HeaderV2& header, uint32_t index) {
+    uint32_t value{};
+    if ((static_cast<size_t>(index) + 1) * sizeof(uint32_t) > sizeof(header.reserved)) {
+        return value;
+    }
+
+    std::memcpy(&value, header.reserved + (static_cast<size_t>(index) * sizeof(uint32_t)), sizeof(value));
+    return value;
+}
+
+bool header_uses_chunked_layout(const encrypted_pak::HeaderV2& header) {
+    return header.algorithm == encrypted_pak::kAlgorithmAes256CbcChunkedHmacSha256 &&
+        (read_header_reserved_u32(header, encrypted_pak::kHeaderReservedFlagsIndex) & encrypted_pak::kHeaderReservedFlagChunkedLayout) != 0;
+}
+
+uint64_t compute_chunk_count(uint64_t plain_size, uint32_t chunk_plain_size) {
+    return chunk_plain_size == 0 ? 0 : ceil_div_u64(plain_size, chunk_plain_size);
+}
+
+uint64_t compute_chunk_plain_size(uint64_t plain_size, uint32_t chunk_plain_size, uint64_t chunk_index) {
+    const auto chunk_start = chunk_index * static_cast<uint64_t>(chunk_plain_size);
+    if (chunk_start >= plain_size) {
+        return 0;
+    }
+
+    const auto remaining = plain_size - chunk_start;
+    return remaining < chunk_plain_size ? remaining : chunk_plain_size;
+}
+
+uint64_t compute_chunk_cipher_size(uint64_t chunk_plain_size) {
+    if (chunk_plain_size == 0) {
+        return 0;
+    }
+
+    return align_up_u64(chunk_plain_size, 16);
+}
+
+uint64_t compute_total_chunk_cipher_size(uint64_t plain_size, uint32_t chunk_plain_size) {
+    const auto chunk_count = compute_chunk_count(plain_size, chunk_plain_size);
+    uint64_t total = 0;
+    for (uint64_t chunk_index = 0; chunk_index < chunk_count; ++chunk_index) {
+        total += compute_chunk_cipher_size(compute_chunk_plain_size(plain_size, chunk_plain_size, chunk_index));
+    }
+
+    return total;
+}
+
+uint32_t extract_v2_metadata_container_size(const encrypted_pak::HeaderV2& header) {
+    if (header_uses_chunked_layout(header)) {
+        return read_header_reserved_u32(header, encrypted_pak::kHeaderReservedMetadataSizeIndex);
+    }
+
+    if (header.header_size <= sizeof(encrypted_pak::HeaderV2)) {
+        return 0;
+    }
+
+    return static_cast<uint32_t>(header.header_size - sizeof(encrypted_pak::HeaderV2));
+}
+
+std::array<uint8_t, 16> derive_chunk_iv(const uint8_t* base_iv, uint64_t chunk_index) {
+    std::array<uint8_t, 16> iv{};
+    std::memcpy(iv.data(), base_iv, iv.size());
+
+    auto carry = chunk_index;
+    for (size_t offset = 0; offset < sizeof(uint64_t); ++offset) {
+        const auto byte_index = iv.size() - 1 - offset;
+        const auto sum = static_cast<uint32_t>(iv[byte_index]) + static_cast<uint32_t>(carry & 0xFF);
+        iv[byte_index] = static_cast<uint8_t>(sum & 0xFF);
+        carry = (carry >> 8) + (sum >> 8);
+    }
+
+    return iv;
+}
+
+std::optional<ChunkedPakLayout> parse_chunked_pak_layout(
+    const encrypted_pak::HeaderV2& header,
+    uint64_t file_size) {
+    if (!header_uses_chunked_layout(header)) {
+        return std::nullopt;
+    }
+
+    ChunkedPakLayout layout{};
+    layout.metadata_container_size = extract_v2_metadata_container_size(header);
+    layout.chunk_plain_size = read_header_reserved_u32(header, encrypted_pak::kHeaderReservedChunkPlainSizeIndex);
+    layout.chunk_auth_tag_size = read_header_reserved_u32(header, encrypted_pak::kHeaderReservedChunkAuthSizeIndex);
+    layout.chunk_count = compute_chunk_count(header.plain_size, layout.chunk_plain_size);
+    layout.chunk_auth_table_offset = sizeof(encrypted_pak::HeaderV2) + static_cast<uint64_t>(layout.metadata_container_size);
+    layout.chunk_auth_table_size = layout.chunk_count * static_cast<uint64_t>(layout.chunk_auth_tag_size);
+    layout.payload_offset = layout.chunk_auth_table_offset + layout.chunk_auth_table_size;
+
+    if (layout.chunk_plain_size == 0 ||
+        (layout.chunk_plain_size % 16) != 0 ||
+        layout.chunk_auth_tag_size != encrypted_pak::kChunkAuthTagSize ||
+        header.header_size != layout.payload_offset ||
+        header.cipher_size != compute_total_chunk_cipher_size(header.plain_size, layout.chunk_plain_size) ||
+        layout.payload_offset > file_size ||
+        header.cipher_size > (file_size - layout.payload_offset)) {
+        return std::nullopt;
+    }
+
+    return layout;
+}
+
+ChunkedPakLayout chunked_layout_from_slice_context(const VirtualPakSliceContext& context) {
+    ChunkedPakLayout layout{};
+    layout.metadata_container_size = context.metadata_container_size;
+    layout.chunk_plain_size = context.chunk_plain_size;
+    layout.chunk_auth_tag_size = context.chunk_auth_tag_size;
+    layout.chunk_count = context.chunk_count;
+    layout.chunk_auth_table_offset = context.chunk_auth_table_offset;
+    layout.chunk_auth_table_size = context.chunk_auth_table_size;
+    layout.payload_offset = context.payload_offset;
+    return layout;
+}
+
+std::optional<std::array<uint8_t, 32>> compute_chunked_container_auth_tag(
+    const encrypted_pak::HeaderV2& header,
+    const uint8_t* auth_table_bytes,
+    size_t auth_table_size,
+    const std::array<uint8_t, 32>& authentication_key) {
+    encrypted_pak::HeaderV2 header_copy = header;
+    std::memset(header_copy.auth_tag, 0, sizeof(header_copy.auth_tag));
+
+    std::vector<uint8_t> auth_input(sizeof(header_copy) + auth_table_size, 0);
+    std::memcpy(auth_input.data(), &header_copy, sizeof(header_copy));
+    if (auth_table_bytes != nullptr && auth_table_size > 0) {
+        std::memcpy(auth_input.data() + sizeof(header_copy), auth_table_bytes, auth_table_size);
+    }
+
+    return compute_hmac_sha256_bytes(auth_input.data(), auth_input.size(), authentication_key);
+}
+
+bool validate_chunked_container_auth(
+    const encrypted_pak::HeaderV2& header,
+    const ChunkedPakLayout& layout,
+    const std::vector<uint8_t>& auth_table,
+    const std::array<uint8_t, 32>& authentication_key) {
+    if (auth_table.size() != layout.chunk_auth_table_size) {
+        return false;
+    }
+
+    const auto auth_tag = compute_chunked_container_auth_tag(
+        header,
+        auth_table.empty() ? nullptr : auth_table.data(),
+        auth_table.size(),
+        authentication_key);
+    return auth_tag.has_value() &&
+        std::memcmp(auth_tag->data(), header.auth_tag, auth_tag->size()) == 0;
+}
+
+std::optional<std::vector<uint8_t>> decrypt_aes256_cbc_chunk(
+    const uint8_t* cipher_bytes,
+    size_t cipher_size,
+    const std::array<uint8_t, 32>& key,
+    const std::array<uint8_t, 16>& iv,
+    uint64_t expected_plain_size,
+    bool use_padding) {
+    if (cipher_size == 0) {
+        return expected_plain_size == 0 ? std::optional<std::vector<uint8_t>>{std::vector<uint8_t>{}} : std::nullopt;
+    }
+
+    if (cipher_size > static_cast<size_t>(std::numeric_limits<ULONG>::max()) ||
+        expected_plain_size > static_cast<uint64_t>(std::numeric_limits<ULONG>::max())) {
+        return std::nullopt;
+    }
+
+    BCRYPT_ALG_HANDLE algorithm{};
+    BCRYPT_KEY_HANDLE key_handle{};
+    DWORD object_size{};
+    DWORD bytes_written{};
+    std::vector<uint8_t> key_object{};
+    std::vector<uint8_t> output(cipher_size + 16, 0);
+    auto iv_copy = iv;
+    ULONG output_size{};
+
+    if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_AES_ALGORITHM, nullptr, 0) != 0) {
+        return std::nullopt;
+    }
+
+    const auto chaining_mode_bytes = static_cast<ULONG>((wcslen(BCRYPT_CHAIN_MODE_CBC) + 1) * sizeof(wchar_t));
+    if (BCryptSetProperty(algorithm, BCRYPT_CHAINING_MODE, reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(BCRYPT_CHAIN_MODE_CBC)), chaining_mode_bytes, 0) != 0 ||
+        BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&object_size), sizeof(object_size), &bytes_written, 0) != 0) {
+        BCryptCloseAlgorithmProvider(algorithm, 0);
+        return std::nullopt;
+    }
+
+    key_object.resize(object_size);
+    if (BCryptGenerateSymmetricKey(
+            algorithm,
+            &key_handle,
+            key_object.data(),
+            static_cast<ULONG>(key_object.size()),
+            const_cast<PUCHAR>(key.data()),
+            static_cast<ULONG>(key.size()),
+            0) != 0) {
+        BCryptCloseAlgorithmProvider(algorithm, 0);
+        return std::nullopt;
+    }
+
+    const auto decrypt_status = BCryptDecrypt(
+        key_handle,
+        const_cast<PUCHAR>(cipher_bytes),
+        static_cast<ULONG>(cipher_size),
+        nullptr,
+        iv_copy.data(),
+        static_cast<ULONG>(iv_copy.size()),
+        output.data(),
+        static_cast<ULONG>(output.size()),
+        &output_size,
+        use_padding ? BCRYPT_BLOCK_PADDING : 0);
+
+    BCryptDestroyKey(key_handle);
+    BCryptCloseAlgorithmProvider(algorithm, 0);
+    if (decrypt_status != 0) {
+        return std::nullopt;
+    }
+
+    output.resize(output_size);
+    if (output.size() != expected_plain_size) {
+        return std::nullopt;
+    }
+
+    return output;
+}
+
+bool validate_chunk_plain_auth(
+    const uint8_t* plain_bytes,
+    size_t plain_size,
+    const uint8_t* expected_auth_tag,
+    const std::array<uint8_t, 32>& authentication_key) {
+    const auto auth_tag = compute_hmac_sha256_bytes(plain_bytes, plain_size, authentication_key);
+    return auth_tag.has_value() &&
+        std::memcmp(auth_tag->data(), expected_auth_tag, auth_tag->size()) == 0;
+}
+
+bool read_exact_file_slice(
+    std::ifstream& input,
+    uint64_t offset,
+    size_t size,
+    std::vector<uint8_t>& buffer) {
+    buffer.resize(size);
+    input.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    if (!input.good()) {
+        return false;
+    }
+
+    input.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(size));
+    return input.gcount() == static_cast<std::streamsize>(size);
+}
+
+bool read_chunked_auth_table(
+    std::ifstream& input,
+    const ChunkedPakLayout& layout,
+    std::vector<uint8_t>& auth_table) {
+    return read_exact_file_slice(
+        input,
+        layout.chunk_auth_table_offset,
+        static_cast<size_t>(layout.chunk_auth_table_size),
+        auth_table);
+}
+
+std::optional<std::vector<uint8_t>> read_v2_chunked_pak_chunk_from_open_file(
+    std::ifstream& input,
+    const encrypted_pak::HeaderV2& header,
+    const DerivedKeyMaterial& material,
+    const ChunkedPakLayout& layout,
+    const std::vector<uint8_t>& auth_table,
+    uint64_t chunk_index) {
+    if (chunk_index >= layout.chunk_count) {
+        return std::nullopt;
+    }
+
+    const auto current_chunk_plain_size = compute_chunk_plain_size(header.plain_size, layout.chunk_plain_size, chunk_index);
+    const auto current_chunk_cipher_size = compute_chunk_cipher_size(current_chunk_plain_size);
+    const auto cipher_offset = layout.payload_offset + (chunk_index * static_cast<uint64_t>(layout.chunk_plain_size));
+    std::vector<uint8_t> cipher_bytes{};
+    if (!read_exact_file_slice(input, cipher_offset, static_cast<size_t>(current_chunk_cipher_size), cipher_bytes)) {
+        return std::nullopt;
+    }
+
+    auto chunk_iv = derive_chunk_iv(header.iv, chunk_index);
+    const auto plain_chunk = decrypt_aes256_cbc_chunk(
+        cipher_bytes.data(),
+        cipher_bytes.size(),
+        material.encryption_key,
+        chunk_iv,
+        current_chunk_plain_size,
+        (current_chunk_plain_size % 16) != 0);
+    if (!plain_chunk.has_value()) {
+        return std::nullopt;
+    }
+
+    const auto auth_table_offset = static_cast<size_t>(chunk_index * layout.chunk_auth_tag_size);
+    if (auth_table_offset + layout.chunk_auth_tag_size > auth_table.size()) {
+        return std::nullopt;
+    }
+
+    const auto* expected_auth_tag = auth_table.data() + auth_table_offset;
+    if (!validate_chunk_plain_auth(plain_chunk->data(), plain_chunk->size(), expected_auth_tag, material.authentication_key)) {
+        return std::nullopt;
+    }
+
+    return plain_chunk;
+}
+
+std::optional<std::vector<uint8_t>> read_v2_chunked_pak_slice_from_open_file(
+    std::ifstream& input,
+    const encrypted_pak::HeaderV2& header,
+    const DerivedKeyMaterial& material,
+    const ChunkedPakLayout& layout,
+    const std::vector<uint8_t>& auth_table,
+    uint64_t plain_offset,
+    size_t bytes_to_read) {
+    if (plain_offset > header.plain_size) {
+        return std::nullopt;
+    }
+
+    const auto remaining_plain = header.plain_size - plain_offset;
+    const auto readable_size = std::min<uint64_t>(remaining_plain, bytes_to_read);
+    if (readable_size == 0) {
+        return std::vector<uint8_t>{};
+    }
+
+    std::vector<uint8_t> output{};
+    output.reserve(static_cast<size_t>(readable_size));
+
+    const auto first_chunk_index = plain_offset / layout.chunk_plain_size;
+    const auto last_chunk_index = (plain_offset + readable_size - 1) / layout.chunk_plain_size;
+    for (uint64_t chunk_index = first_chunk_index; chunk_index <= last_chunk_index; ++chunk_index) {
+        const auto plain_chunk = read_v2_chunked_pak_chunk_from_open_file(
+            input,
+            header,
+            material,
+            layout,
+            auth_table,
+            chunk_index);
+        if (!plain_chunk.has_value()) {
+            return std::nullopt;
+        }
+
+        const auto chunk_plain_offset = chunk_index * static_cast<uint64_t>(layout.chunk_plain_size);
+        const auto slice_begin = plain_offset > chunk_plain_offset
+            ? static_cast<size_t>(plain_offset - chunk_plain_offset)
+            : static_cast<size_t>(0);
+        const auto slice_end_plain = std::min<uint64_t>(
+            chunk_plain_offset + plain_chunk->size(),
+            plain_offset + readable_size);
+        const auto slice_end = static_cast<size_t>(slice_end_plain - chunk_plain_offset);
+        if (slice_begin > slice_end || slice_end > plain_chunk->size()) {
+            return std::nullopt;
+        }
+
+        output.insert(output.end(), plain_chunk->begin() + static_cast<std::ptrdiff_t>(slice_begin), plain_chunk->begin() + static_cast<std::ptrdiff_t>(slice_end));
+    }
+
+    return output;
+}
+
+std::optional<std::vector<uint8_t>> decode_v2_chunked_pak_bytes(
+    const std::vector<uint8_t>& file_bytes,
+    const encrypted_pak::HeaderV2& header,
+    const DerivedKeyMaterial& material) {
+    const auto layout = parse_chunked_pak_layout(header, file_bytes.size());
+    if (!layout.has_value()) {
+        append_log_line("virtual-loader-header-size-invalid\n");
+        return std::nullopt;
+    }
+
+    const auto auth_table_bytes = file_bytes.data() + layout->chunk_auth_table_offset;
+    if (!validate_chunked_container_auth(
+            header,
+            *layout,
+            std::vector<uint8_t>(auth_table_bytes, auth_table_bytes + static_cast<size_t>(layout->chunk_auth_table_size)),
+            material.authentication_key)) {
+        append_log_line("virtual-loader-auth-failed\n");
+        return std::nullopt;
+    }
+
+    if (header.plain_size > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+        append_log_line("virtual-loader-decrypt-size-too-large\n");
+        return std::nullopt;
+    }
+
+    std::vector<uint8_t> plain_bytes{};
+    plain_bytes.reserve(static_cast<size_t>(header.plain_size));
+
+    for (uint64_t chunk_index = 0; chunk_index < layout->chunk_count; ++chunk_index) {
+        const auto current_chunk_plain_size = compute_chunk_plain_size(header.plain_size, layout->chunk_plain_size, chunk_index);
+        const auto current_chunk_cipher_size = compute_chunk_cipher_size(current_chunk_plain_size);
+        const auto cipher_offset = layout->payload_offset + (chunk_index * static_cast<uint64_t>(layout->chunk_plain_size));
+        auto chunk_iv = derive_chunk_iv(header.iv, chunk_index);
+        const auto chunk_plain = decrypt_aes256_cbc_chunk(
+            file_bytes.data() + cipher_offset,
+            static_cast<size_t>(current_chunk_cipher_size),
+            material.encryption_key,
+            chunk_iv,
+            current_chunk_plain_size,
+            (current_chunk_plain_size % 16) != 0);
+        if (!chunk_plain.has_value()) {
+            append_log_line("virtual-loader-decrypt-failed\n");
+            return std::nullopt;
+        }
+
+        const auto* expected_auth_tag = auth_table_bytes + (chunk_index * layout->chunk_auth_tag_size);
+        if (!validate_chunk_plain_auth(chunk_plain->data(), chunk_plain->size(), expected_auth_tag, material.authentication_key)) {
+            append_log_line("virtual-loader-auth-failed\n");
+            return std::nullopt;
+        }
+
+        plain_bytes.insert(plain_bytes.end(), chunk_plain->begin(), chunk_plain->end());
+    }
+
+    return plain_bytes;
+}
+
 std::optional<std::vector<uint8_t>> decode_v2_encrypted_pak_bytes(
     const std::vector<uint8_t>& file_bytes,
     uint32_t expected_purpose) {
@@ -1128,8 +1574,7 @@ std::optional<std::vector<uint8_t>> decode_v2_encrypted_pak_bytes(
     }
 
     if (header.header_size < sizeof(encrypted_pak::HeaderV2) ||
-        header.header_size > file_bytes.size() ||
-        header.algorithm != encrypted_pak::kAlgorithmAes256CbcHmacSha256) {
+        header.header_size > file_bytes.size()) {
         append_log_line("virtual-loader-header-size-invalid\n");
         return std::nullopt;
     }
@@ -1140,15 +1585,6 @@ std::optional<std::vector<uint8_t>> decode_v2_encrypted_pak_bytes(
             << " actual=" << header.purpose
             << "\n";
         append_log_line(oss.str());
-        return std::nullopt;
-    }
-
-    const auto payload_offset = static_cast<size_t>(header.header_size);
-    if (header.cipher_size == 0 ||
-        (header.cipher_size % 16) != 0 ||
-        header.cipher_size > file_bytes.size() ||
-        payload_offset + header.cipher_size > file_bytes.size()) {
-        append_log_line("virtual-loader-header-size-invalid\n");
         return std::nullopt;
     }
 
@@ -1163,6 +1599,24 @@ std::optional<std::vector<uint8_t>> decode_v2_encrypted_pak_bytes(
             << " actual=" << hex_encode_bytes(header.game_fingerprint, material->game_fingerprint.size())
             << "\n";
         append_log_line(oss.str());
+        return std::nullopt;
+    }
+
+    if (header.algorithm == encrypted_pak::kAlgorithmAes256CbcChunkedHmacSha256) {
+        return decode_v2_chunked_pak_bytes(file_bytes, header, *material);
+    }
+
+    if (header.algorithm != encrypted_pak::kAlgorithmAes256CbcHmacSha256) {
+        append_log_line("virtual-loader-header-size-invalid\n");
+        return std::nullopt;
+    }
+
+    const auto payload_offset = static_cast<size_t>(header.header_size);
+    if (header.cipher_size == 0 ||
+        (header.cipher_size % 16) != 0 ||
+        header.cipher_size > file_bytes.size() ||
+        payload_offset + header.cipher_size > file_bytes.size()) {
+        append_log_line("virtual-loader-header-size-invalid\n");
         return std::nullopt;
     }
 
@@ -1338,7 +1792,20 @@ std::optional<ModMetadataRecord> load_mod_metadata_record(const std::filesystem:
         return record;
     }
 
-    const auto metadata_size = static_cast<size_t>(header.header_size - sizeof(encrypted_pak::HeaderV2));
+    const auto metadata_size = static_cast<size_t>(extract_v2_metadata_container_size(header));
+    if (metadata_size == 0) {
+        return record;
+    }
+
+    if (static_cast<uint64_t>(metadata_size) > (static_cast<uint64_t>(header.header_size) - sizeof(encrypted_pak::HeaderV2))) {
+        std::ostringstream oss;
+        oss << "mhwsmod-metadata-size-invalid source=" << narrow_utf8(record.source_path)
+            << " size=" << metadata_size
+            << "\n";
+        append_log_line(oss.str());
+        return std::nullopt;
+    }
+
     std::vector<uint8_t> metadata_bytes(metadata_size, 0);
     input.read(reinterpret_cast<char*>(metadata_bytes.data()), static_cast<std::streamsize>(metadata_bytes.size()));
     if (input.gcount() != static_cast<std::streamsize>(metadata_bytes.size())) {
@@ -1414,6 +1881,95 @@ bool decrypt_v2_encrypted_pak_to_file(
     std::ifstream input(source_path, std::ios::binary);
     if (!input) {
         append_log_line("mhwsmod-read-failed\n");
+        return false;
+    }
+
+    if (header_uses_chunked_layout(header)) {
+        std::error_code size_ec{};
+        const auto source_size = std::filesystem::file_size(source_path, size_ec);
+        if (size_ec) {
+            append_log_line("mhwsmod-header-size-invalid\n");
+            return false;
+        }
+
+        const auto layout = parse_chunked_pak_layout(header, source_size);
+        if (!layout.has_value()) {
+            append_log_line("mhwsmod-header-invalid\n");
+            return false;
+        }
+
+        std::vector<uint8_t> auth_table{};
+        if (!read_chunked_auth_table(input, *layout, auth_table)) {
+            append_log_line("mhwsmod-read-short\n");
+            return false;
+        }
+
+        if (!validate_chunked_container_auth(header, *layout, auth_table, material->authentication_key)) {
+            append_log_line("mhwsmod-auth-failed\n");
+            return false;
+        }
+
+        std::ofstream output(output_path, std::ios::binary | std::ios::trunc);
+        if (!output) {
+            append_log_line("mhwsmod-stage-write-failed\n");
+            return false;
+        }
+
+        auto cleanup_output = [&]() {
+            output.close();
+            std::error_code cleanup_ec{};
+            std::filesystem::remove(output_path, cleanup_ec);
+        };
+
+        uint64_t plain_size = 0;
+        for (uint64_t chunk_index = 0; chunk_index < layout->chunk_count; ++chunk_index) {
+            const auto plain_chunk = read_v2_chunked_pak_chunk_from_open_file(
+                input,
+                header,
+                *material,
+                *layout,
+                auth_table,
+                chunk_index);
+            if (!plain_chunk.has_value()) {
+                cleanup_output();
+                append_log_line("mhwsmod-decrypt-failed\n");
+                return false;
+            }
+
+            if (!plain_chunk->empty()) {
+                output.write(reinterpret_cast<const char*>(plain_chunk->data()), static_cast<std::streamsize>(plain_chunk->size()));
+                if (!output.good()) {
+                    cleanup_output();
+                    append_log_line("mhwsmod-stage-write-failed\n");
+                    return false;
+                }
+            }
+
+            plain_size += plain_chunk->size();
+        }
+
+        if (plain_size != header.plain_size) {
+            cleanup_output();
+            append_log_line("mhwsmod-size-mismatch\n");
+            return false;
+        }
+
+        output.flush();
+        if (!output.good()) {
+            cleanup_output();
+            append_log_line("mhwsmod-stage-write-failed\n");
+            return false;
+        }
+
+        output.close();
+        if (plain_size_out != nullptr) {
+            *plain_size_out = plain_size;
+        }
+        return true;
+    }
+
+    if (header.algorithm != encrypted_pak::kAlgorithmAes256CbcHmacSha256) {
+        append_log_line("mhwsmod-header-invalid\n");
         return false;
     }
 
@@ -1631,7 +2187,6 @@ std::optional<uint64_t> stage_encrypted_container_to_file(
         std::memcpy(&header, header_bytes.data(), sizeof(header));
         if (header.version != encrypted_pak::kVersion ||
             header.header_size < sizeof(encrypted_pak::HeaderV2) ||
-            header.algorithm != encrypted_pak::kAlgorithmAes256CbcHmacSha256 ||
             header.purpose != encrypted_pak::kPurposePak ||
             header.cipher_size == 0 ||
             (header.cipher_size % 16) != 0) {
@@ -1732,6 +2287,184 @@ std::vector<std::wstring> stage_selected_encrypted_mods_into_local_dir(
 
 std::vector<std::wstring> stage_encrypted_custom_mods_into_local_dir(const VirtualPakLoaderConfig& config) {
     return stage_selected_encrypted_mods_into_local_dir(config, resolve_encrypted_custom_mod_paths());
+}
+
+std::optional<VirtualPakHandleState> prepare_virtual_pak_handle_state(const VirtualPakLoaderConfig& config) {
+    if (!config.enabled || config.source_path.empty()) {
+        return std::nullopt;
+    }
+
+    VirtualPakHandleState state{};
+    state.source_path = config.source_path;
+
+    if (config.plain_source) {
+        const auto payload = load_virtual_pak_payload();
+        if (!payload.has_value()) {
+            return std::nullopt;
+        }
+
+        state.payload = *payload;
+        state.plain_size = (*payload)->size();
+        return state;
+    }
+
+    const std::filesystem::path source_path{config.source_path};
+    std::error_code file_size_ec{};
+    const auto source_size = std::filesystem::file_size(source_path, file_size_ec);
+    if (file_size_ec || source_size < sizeof(encrypted_pak::HeaderV2)) {
+        const auto payload = load_virtual_pak_payload();
+        if (!payload.has_value()) {
+            return std::nullopt;
+        }
+
+        state.payload = *payload;
+        state.plain_size = (*payload)->size();
+        return state;
+    }
+
+    encrypted_pak::HeaderV2 header{};
+    {
+        ScopedInternalBackendOpen internal_open_guard{};
+        std::ifstream input(source_path, std::ios::binary);
+        if (!input) {
+            append_log_line("virtual-loader-source-read-failed\n");
+            return std::nullopt;
+        }
+
+        input.read(reinterpret_cast<char*>(&header), static_cast<std::streamsize>(sizeof(header)));
+        if (input.gcount() != static_cast<std::streamsize>(sizeof(header))) {
+            append_log_line("virtual-loader-source-read-failed\n");
+            return std::nullopt;
+        }
+
+        if (std::memcmp(header.magic, encrypted_pak::kMagic.data(), encrypted_pak::kMagic.size()) != 0 ||
+            header.version != encrypted_pak::kVersion ||
+            header.purpose != encrypted_pak::kPurposePak ||
+            !header_uses_chunked_layout(header)) {
+            const auto payload = load_virtual_pak_payload();
+            if (!payload.has_value()) {
+                return std::nullopt;
+            }
+
+            state.payload = *payload;
+            state.plain_size = (*payload)->size();
+            return state;
+        }
+
+        const auto material = derive_v2_key_material(header.purpose);
+        if (!material.has_value()) {
+            return std::nullopt;
+        }
+
+        if (std::memcmp(header.game_fingerprint, material->game_fingerprint.data(), material->game_fingerprint.size()) != 0) {
+            std::ostringstream oss;
+            oss << "virtual-loader-fingerprint-mismatch expected="
+                << hex_encode_bytes(material->game_fingerprint.data(), material->game_fingerprint.size())
+                << " actual="
+                << hex_encode_bytes(header.game_fingerprint, material->game_fingerprint.size())
+                << "\n";
+            append_log_line(oss.str());
+            return std::nullopt;
+        }
+
+        const auto layout = parse_chunked_pak_layout(header, source_size);
+        if (!layout.has_value()) {
+            append_log_line("virtual-loader-header-size-invalid\n");
+            return std::nullopt;
+        }
+
+        std::vector<uint8_t> auth_table{};
+        if (!read_chunked_auth_table(input, *layout, auth_table)) {
+            append_log_line("virtual-loader-source-read-failed\n");
+            return std::nullopt;
+        }
+
+        if (!validate_chunked_container_auth(header, *layout, auth_table, material->authentication_key)) {
+            append_log_line("virtual-loader-auth-failed\n");
+            return std::nullopt;
+        }
+
+        auto slice_context = std::make_shared<VirtualPakSliceContext>();
+        slice_context->header = header;
+        slice_context->material = *material;
+        slice_context->metadata_container_size = layout->metadata_container_size;
+        slice_context->chunk_plain_size = layout->chunk_plain_size;
+        slice_context->chunk_auth_tag_size = layout->chunk_auth_tag_size;
+        slice_context->chunk_count = layout->chunk_count;
+        slice_context->chunk_auth_table_offset = layout->chunk_auth_table_offset;
+        slice_context->chunk_auth_table_size = layout->chunk_auth_table_size;
+        slice_context->payload_offset = layout->payload_offset;
+        slice_context->auth_table = std::move(auth_table);
+
+        state.slice_context = std::move(slice_context);
+        state.plain_size = header.plain_size;
+    }
+
+    std::ostringstream oss;
+    oss << "virtual-loader-slice-context-ready source=" << narrow_utf8(config.source_path)
+        << " plain_size=0x" << std::hex << state.plain_size
+        << "\n";
+    append_log_line(oss.str());
+    return state;
+}
+
+std::optional<std::vector<uint8_t>> read_virtual_pak_bytes(
+    const VirtualPakHandleState& state,
+    uint64_t plain_offset,
+    size_t bytes_to_read,
+    DWORD* last_error) {
+    if (last_error != nullptr) {
+        *last_error = ERROR_SUCCESS;
+    }
+
+    if (plain_offset >= state.plain_size || bytes_to_read == 0) {
+        return std::vector<uint8_t>{};
+    }
+
+    if (state.payload != nullptr) {
+        const auto available = std::min<uint64_t>(state.plain_size - plain_offset, bytes_to_read);
+        std::vector<uint8_t> output(static_cast<size_t>(available), 0);
+        if (!output.empty()) {
+            std::memcpy(output.data(), state.payload->data() + plain_offset, output.size());
+        }
+        return output;
+    }
+
+    if (state.slice_context == nullptr) {
+        if (last_error != nullptr) {
+            *last_error = ERROR_INVALID_DATA;
+        }
+        return std::nullopt;
+    }
+
+    ScopedInternalBackendOpen internal_open_guard{};
+    std::ifstream input(std::filesystem::path{state.source_path}, std::ios::binary);
+    if (!input) {
+        if (last_error != nullptr) {
+            *last_error = ERROR_FILE_NOT_FOUND;
+        }
+        append_log_line("virtual-loader-source-read-failed\n");
+        return std::nullopt;
+    }
+
+    const auto layout = chunked_layout_from_slice_context(*state.slice_context);
+    const auto slice = read_v2_chunked_pak_slice_from_open_file(
+        input,
+        state.slice_context->header,
+        state.slice_context->material,
+        layout,
+        state.slice_context->auth_table,
+        plain_offset,
+        bytes_to_read);
+    if (!slice.has_value()) {
+        if (last_error != nullptr) {
+            *last_error = ERROR_INVALID_DATA;
+        }
+        append_log_line("virtual-loader-slice-read-failed\n");
+        return std::nullopt;
+    }
+
+    return slice;
 }
 
 std::optional<std::shared_ptr<std::vector<uint8_t>>> load_virtual_pak_payload() {

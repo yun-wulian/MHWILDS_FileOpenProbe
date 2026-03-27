@@ -2,15 +2,15 @@
 
 ## Current Goal
 
-This project no longer targets a pure in-memory pak backend.
+The current experimental goal is to recover a pure-memory pak path that can survive the game's long-lived pak handles and arbitrary offset reads.
 
-The accepted runtime goal is:
+The accepted near-term goal is:
 
-- scan `.mhwsmod` files during startup
-- decrypt them synchronously before exposing custom pak slots to the game
-- stage plaintext pak bytes into randomized temp paths using non-`.pak` runtime file extensions
-- load those staged `.pak` files through the existing rf-chain route
-- prefer startup cleanup for stale leftovers instead of relying on DLL detach timing
+- keep the existing staged plaintext path as a fallback
+- switch the encrypted pak payload layout to chunked random-access form
+- make the container readable at arbitrary plaintext offsets without full-file buffering
+- preserve the existing encrypted metadata block so update gating stays compatible
+- reuse the same chunk mapping later for native stream hooks
 
 ## Hard Constraints
 
@@ -34,11 +34,13 @@ The old prototype format remains supported as legacy `v1`:
 The new default format is `v2`:
 
 - magic: `MHWSEP2`
-- algorithm:
+- algorithms:
   - `3`: AES-256-CBC + HMAC-SHA256
+  - `4`: chunked AES-256-CBC + per-chunk HMAC-SHA256
 - explicit `purpose`
   - `1`: pak payload
   - `2`: encrypted temp-index payload
+  - `3`: encrypted metadata payload
 
 ### Why `v2`
 
@@ -79,9 +81,23 @@ The `v2` header contains:
 - `iv`
 - `auth_tag`
 
-`auth_tag` is `HMAC-SHA256` over the plaintext payload.
+For algorithm `3`, `auth_tag` is `HMAC-SHA256` over the plaintext payload.
 
-This choice keeps runtime decrypt simple:
+For algorithm `4`, the layout is:
+
+- `HeaderV2`
+- encrypted metadata container
+- per-chunk auth table
+- chunked pak ciphertext
+
+In chunked mode:
+
+- `header.reserved[0..15]` stores flags, metadata container size, plain chunk size, and per-chunk auth tag size
+- `header.auth_tag` becomes a container-level HMAC over `zeroed-header-auth_tag + auth_table`
+- each auth-table entry stores `HMAC-SHA256` over one plaintext chunk
+- payload chunk `i` is addressed by plaintext chunk index, so arbitrary offset reads can be mapped without sequential state
+
+This choice keeps runtime decrypt simple for staged fallback and also gives the native path a stable random-access mapping:
 
 - one pass over the ciphertext
 - decrypt chunk by chunk
@@ -95,7 +111,7 @@ For each `.mhwsmod` file:
 1. Read and validate the container header.
 2. Compare the stored game fingerprint with the current exe MD5.
 3. Derive purpose-specific keys.
-4. Decrypt to a randomized temp `.pak` path.
+4. Either decrypt to a randomized temp `.pak` path or serve chunk slices directly from the encrypted source.
 5. Verify the final HMAC.
 6. Only append the staged `.pak` path to the rf-chain list after verification succeeds.
 
@@ -155,7 +171,8 @@ The user-facing implication is:
 
 ## Near-Term Work
 
-- implement the `v2` header and loader support
-- switch the packer to emit authenticated `v2` files by default
+- implement chunked `v2` pak payload support end to end
+- switch the packer to emit authenticated chunked `v2` files by default
 - keep `v1` read compatibility during transition
+- keep the staged path working while native stream hooks are still incomplete
 - later reuse the same format for the encrypted temp-index file
