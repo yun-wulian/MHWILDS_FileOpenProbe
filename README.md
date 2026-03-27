@@ -1,6 +1,8 @@
 # MHWILDS File Open Probe
 
-`MHWILDS_FileOpenProbe` is the standalone probe / version proxy project used to study Monster Hunter Wilds pak loading and to prototype a staged plaintext loader with encrypted custom mod packaging.
+`MHWILDS_FileOpenProbe` is the standalone probe / version proxy project used to study Monster Hunter Wilds pak loading and to prototype encrypted custom mod packaging.
+
+The repository currently contains one usable staged-plaintext route and one unfinished pure-memory experiment route. Do not read the presence of the virtual backend code as proof that pure-memory pak decryption is solved.
 
 Current encryption-format notes live in:
 
@@ -22,7 +24,7 @@ What is already confirmed:
 - REFramework custom pak loading only does path redirection.
 - REFramework raises the patch upper bound, scans `pak_mods`, and rewrites requested pak paths.
 - It does not provide an in-memory pak backend.
-- Our proxy can intercept the later Win32 pak I/O chain and can return synthetic file semantics.
+- Our proxy can decrypt and stage `.mhwsmod` packages into randomized temp plaintext `.pak` files, then load them through the same rf-chain path as ordinary custom paks.
 - Hardware-breakpoint tracing showed that later consumer-side activity touches request-owner state asynchronously.
 - The traced consumer-side path lands inside the process `dinput8.dll`, which in this environment is REFramework's proxy layer.
 
@@ -35,10 +37,24 @@ The current implementation direction is different from the earlier same-point co
 
 What is not solved yet:
 
-- We still need to verify whether same-point `SafetyHook` hooks can coexist cleanly with REFramework in this specific pak-loading path.
-- The current test build only targets explicit external pak paths first; temp staging and encryption will come later.
+- Pure-memory pak loading is still not solved.
+- The current pure-memory branch can reach the read path and decrypt requested ranges, but the game still rejects or blackscreens on the virtualized backend.
+- The remaining blocker is not pak-path discovery. The blocker is reproducing the file-object, query, mapping, async completion, and ordering invariants that the game and REFramework's `dinput8.dll` path still expect after redirection.
+- Current code in the pure-memory area should be treated as an experiment checkpoint, not as a finished backend.
 
-## Project Layout## Project Layout
+## Branch Status
+
+- `main`
+  - Current usable branch.
+  - Encrypted `.mhwsmod` files are handled by startup decryption / temp staging and then loaded through the rf-chain patch-slot route.
+  - Metadata fields are optional. Per-mod update checks only run when the package is authenticated and both `mod_version` and `update_url` are present.
+  - A bare single-DLL deployment without `mhwilds_virtual_pak_loader.ini` now defaults to the rf-chain route instead of a no-op config.
+- `wip/ntreadfile-backed-experiment-20260326`
+  - Pure-memory `NtReadFile` / `ReadFile` experiment checkpoint.
+  - Kept because it captures the current reverse-engineering state and hook layout.
+  - Not a working pure-memory solution and not the recommended deployment branch.
+
+## Project Layout
 
 The loader code is now a normal multi-translation-unit C++ layout. `src/plugin.cpp` stays thin and the actual implementation lives in `src/plugin/*.cpp`, with shared declarations centralized in one internal header.
 
@@ -182,7 +198,7 @@ The current same-point extension experiment typically uses:
 
 If `custom_pak_dir` is omitted, the proxy falls back to `<game root>\test_pak`.
 If `re2_fw_config.txt` contains `IntegrityCheckBypass_LoadPakDirectory=true`, `<game root>\pak_mods` is inserted before `custom_pak_dir` / `test_pak` in the synthetic patch-slot order.
-In the current prototype, `<game root>\pak_mods\*.mhwsmod` is also scanned. Those files are decrypted at startup into a per-launch randomized temp directory under the system temp root, with randomized non-`.pak` runtime filenames, then loaded through the same rf_chain path as ordinary custom paks. Current direction is to prefer startup cleanup of stale leftovers rather than depending on detach-time cleanup.
+In the current prototype, `<game root>\pak_mods\*.mhwsmod` is also scanned. Those files are decrypted at startup into a per-launch randomized temp directory under the system temp root, with randomized non-`.pak` runtime filenames, then loaded through the same rf_chain path as ordinary custom paks. This staged plaintext path is the current usable path; it is not the unfinished pure-memory backend. Current direction is to prefer startup cleanup of stale leftovers rather than depending on detach-time cleanup.
 
 Loader update gate fields:
 The loader build version is baked into the DLL at build time. The current prototype checks a built-in update source URL, and if it reports a newer loader version, the `version.dll` proxy shows a message box and skips installing its pak-loading logic for that launch.
@@ -239,13 +255,16 @@ Our current proxy now mirrors the directory-scan contract itself for testing:
 
 ## Why The Current Backend Likely Fails
 
-The current synthetic-file backend probably still misses one or more of these:
+The current pure-memory synthetic-file backend probably still misses one or more of these:
 
+- a real file-object invariant that causes the virtual handle path to be closed or rejected earlier than the plaintext baseline
 - file-information semantics
 - mapping semantics
 - expected ordering between open / query / map / read paths
+- asynchronous completion behavior across the later `NtReadFile` / `ReadFile` consumer chain
 - a later chain that still assumes a real underlying file object
 - an interaction introduced by REFramework's own `dinput8.dll` route
+- a baseline behavior where matching a few sampled read bytes is still insufficient because the bytes are delivered under the wrong backend state or lifecycle
 
 That is the current bottleneck, not pak-path discovery.
 
