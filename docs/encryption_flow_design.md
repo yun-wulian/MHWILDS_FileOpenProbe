@@ -1,21 +1,23 @@
 # Encryption Flow Design
 
-## Current Goal
+## Current Status
 
-The current experimental goal is to recover a pure-memory pak path that can survive the game's long-lived pak handles and arbitrary offset reads.
+`main` now has a validated pure-memory encrypted pak route for chunked `v2` `.mhwsmod` packages.
 
-The accepted near-term goal is:
+The currently proven backend is the WinAPI virtual-handle path: the game receives a virtualized file object while the loader decrypts requested plaintext slices on demand from the encrypted container. This keeps plaintext off disk and avoids holding the whole plaintext pak in memory for chunked payloads.
 
-- keep the existing staged plaintext path as a fallback
-- switch the encrypted pak payload layout to chunked random-access form
+The accepted direction is now:
+
+- keep the existing staged plaintext path only as fallback infrastructure
+- use chunked random-access encrypted payloads as the primary format for encrypted pak delivery
 - make the container readable at arbitrary plaintext offsets without full-file buffering
 - preserve the existing encrypted metadata block so update gating stays compatible
-- reuse the same chunk mapping later for native stream hooks
+- keep native game stream hooks as analysis / future-hardening targets, not as the current serving path
 
 ## Hard Constraints
 
-- The decrypt / staging step must block custom pak exposure.
-- We must not let the game finish pak enumeration before staged files exist.
+- The virtual handle and slice context must be ready before custom pak exposure.
+- We must not let the game finish pak enumeration before the encrypted packages can answer size / seek / read queries.
 - Real user setups may include several GB of mod data.
 - Startup performance matters, so the format and loader must be stream-friendly.
 - We should reuse the same encrypted container design for future temp-index storage.
@@ -142,15 +144,15 @@ Recommended defaults:
 
 ## Multi-Threading
 
-Multi-threaded decrypt / staging is still the preferred optimization path, but it is a second step.
+Multi-threaded slice preparation / verification is still an optimization path, but it is no longer the blocker for encrypted pak loading.
 
-The immediate priority is:
+The current working priority is:
 
-1. complete the `v2` container
-2. make single-process decrypt / verify correct
-3. keep the startup path blocking
+1. keep the `v2` random-slice path correct under arbitrary offset reads
+2. harden the virtual-handle query / mapping surface where the game may ask for more file semantics
+3. reduce open-time overhead without reintroducing plaintext staging
 
-After that, we can parallelize independent `.mhwsmod` files while still waiting for all staging work to finish before the custom pak chain is exposed.
+After that, we can parallelize independent `.mhwsmod` preparation and concurrent slice servicing where it materially improves startup or streaming latency.
 
 ## Error Model
 

@@ -2,7 +2,9 @@
 
 `MHWILDS_FileOpenProbe` is the standalone probe / version proxy project used to study Monster Hunter Wilds pak loading and to prototype encrypted custom mod packaging.
 
-The repository currently contains one usable staged-plaintext route and one unfinished pure-memory experiment route. Do not read the presence of the virtual backend code as proof that pure-memory pak decryption is solved.
+The repository now contains a working pure-memory encrypted pak route on `main`.
+
+The current successful backend is a WinAPI virtual-handle streaming path that serves decrypted bytes on demand from chunked `v2` `.mhwsmod` packages. It does not stage a full plaintext `.pak` to disk, and for the chunked format it does not need to keep the whole plaintext pak in memory.
 
 Current encryption-format notes live in:
 
@@ -14,6 +16,7 @@ The current goal is narrow:
 - Read REFramework's config to decide whether `pak_mods` should be included.
 - Install our own same-point hooks on the patch-version and pak-open call sites.
 - Map `reframework\pak_mods` first, then append our own pak paths after that.
+- Keep the working pure-memory route as the primary encrypted-mod path while retaining older staging infrastructure as fallback code.
 
 This project is not a REFramework fork. It is a separate `version.dll` proxy loaded by the game at process start.
 
@@ -24,35 +27,31 @@ What is already confirmed:
 - REFramework custom pak loading only does path redirection.
 - REFramework raises the patch upper bound, scans `pak_mods`, and rewrites requested pak paths.
 - It does not provide an in-memory pak backend.
-- Our proxy can decrypt and stage `.mhwsmod` packages into randomized temp plaintext `.pak` files, then load them through the same rf-chain path as ordinary custom paks.
-- Hardware-breakpoint tracing showed that later consumer-side activity touches request-owner state asynchronously.
-- The traced consumer-side path lands inside the process `dinput8.dll`, which in this environment is REFramework's proxy layer.
+- Our proxy can now load encrypted `.mhwsmod` packages through a pure-memory route backed by WinAPI virtual handles plus on-demand slice decrypt.
+- The working serving chain is `CreateFileW`, `ReadFile`, `SetFilePointerEx`, `GetFileSizeEx`, `GetFileType`, `GetFileInformationByHandle`, `GetFileInformationByHandleEx`, `NtQueryInformationFile`, `CreateFileMappingW`, `MapViewOfFile`, `CloseHandle`, plus the DirectStorage open interception used by the current backend.
+- The successful encrypted path uses chunked `v2` / algorithm `4`, so arbitrary plaintext offsets can be decrypted without loading the full plaintext pak.
+- Metadata fields are optional. Per-mod update checks only run when the package is authenticated and both `mod_version` and `update_url` are present.
+- A bare single-DLL deployment without `mhwilds_virtual_pak_loader.ini` now defaults to the rf-chain route instead of a no-op config.
+- The old staged-path code is still present in the repository, but it is no longer the main encrypted-mod path on `main`.
 
-The current implementation direction is different from the earlier same-point coexistence experiment:
+Known limits of the current pure-memory implementation:
 
-- We no longer depend on REFramework's own redirect hook to service `pak_mods`.
-- Our proxy reads `re2_fw_config.txt`, decides whether `IntegrityCheckBypass_LoadPakDirectory` is enabled, and then builds one combined custom pak chain:
-  - `pak_mods\*.pak`
-  - our own `custom_pak_dir` / `test_pak`
-
-What is not solved yet:
-
-- Pure-memory pak loading is still not solved.
-- The current pure-memory branch can reach the read path and decrypt requested ranges, but the game still rejects or blackscreens on the virtualized backend.
-- The remaining blocker is not pak-path discovery. The blocker is reproducing the file-object, query, mapping, async completion, and ordering invariants that the game and REFramework's `dinput8.dll` path still expect after redirection.
-- Current code in the pure-memory area should be treated as an experiment checkpoint, not as a finished backend.
+- The current success path is still the WinAPI virtual backend, not the native game stream functions.
+- Native `OpenFileOrResourceStream` and `ReadFileOrResourceStream` hooks remain probe / logging hooks only.
+- `CreateFileMappingW` support for slice-backed handles is still narrower than the ordinary `ReadFile` path, so the proven deployment route is the confirmed streaming path already exercised by the game.
 
 ## Branch Status
 
 - `main`
-  - Current usable branch.
-  - Encrypted `.mhwsmod` files are handled by startup decryption / temp staging and then loaded through the rf-chain patch-slot route.
+  - Current recommended branch.
+  - Encrypted `.mhwsmod` files now load through the pure-memory on-demand decrypt route.
+  - The loader keeps the old staging infrastructure in the tree, but the successful encrypted-mod path on this branch does not depend on plaintext temp staging.
   - Metadata fields are optional. Per-mod update checks only run when the package is authenticated and both `mod_version` and `update_url` are present.
-  - A bare single-DLL deployment without `mhwilds_virtual_pak_loader.ini` now defaults to the rf-chain route instead of a no-op config.
+  - A bare single-DLL deployment without `mhwilds_virtual_pak_loader.ini` defaults to the rf-chain route instead of a no-op config.
 - `wip/ntreadfile-backed-experiment-20260326`
-  - Pure-memory `NtReadFile` / `ReadFile` experiment checkpoint.
-  - Kept because it captures the current reverse-engineering state and hook layout.
-  - Not a working pure-memory solution and not the recommended deployment branch.
+  - Older pure-memory experiment checkpoint.
+  - Kept because it captures earlier reverse-engineering state and hook layout.
+  - Not the recommended deployment branch.
 
 ## Project Layout
 
